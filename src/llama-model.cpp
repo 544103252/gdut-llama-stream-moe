@@ -1269,7 +1269,11 @@ static bool llama_moe_stream_is_exps_name(const std::string & name) {
 
 // resolve the per-layer expert cache slot count; returns 0 when streaming should not be enabled
 // (not a MoE model, or the cache would hold every expert anyway)
-static uint32_t llama_moe_stream_resolve_slots(const llama_model_params & params, const llama_hparams & hparams, const llama_model_loader & ml) {
+static uint32_t llama_moe_stream_resolve_slots(
+        const llama_model_params & params,
+        const llama_hparams & hparams,
+        const llama_model_loader & ml,
+        bool full_cache_test) {
     if (hparams.n_expert == 0 || hparams.n_expert_used == 0) {
         LLAMA_LOG_WARN("%s: MoE expert streaming requires a MoE model -- disabled\n", __func__);
         return 0;
@@ -1294,7 +1298,6 @@ static uint32_t llama_moe_stream_resolve_slots(const llama_model_params & params
         n_slots = std::clamp<uint32_t>(2*hparams.n_expert_used, 16, hparams.n_expert);
     }
 
-    const bool full_cache_test = std::getenv("LLAMA_MOE_STREAM_FULL_CACHE_TEST") != nullptr;
     if (n_slots == hparams.n_expert && full_cache_test) {
         LLAMA_LOG_WARN("%s: full-cache Stream MoE test enabled for all %u experts\n",
                 __func__, hparams.n_expert);
@@ -1400,12 +1403,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     pimpl->dev_output = get_layer_buft_list(n_layer_all);
 
     if (params.moe_stream) {
-        const uint32_t n_slots = llama_moe_stream_resolve_slots(params, hparams, ml);
+        const bool full_cache_test = std::getenv("LLAMA_MOE_STREAM_FULL_CACHE_TEST") != nullptr;
+        const uint32_t n_slots = llama_moe_stream_resolve_slots(params, hparams, ml, full_cache_test);
         if (n_slots > 0) {
             if (pimpl->has_tensor_overrides) {
                 LLAMA_LOG_WARN("%s: tensor buffer overrides (-ot/--cpu-moe) do not apply to SSD-streamed expert tensors\n", __func__);
             }
-            pimpl->moe_stream = std::make_unique<llama_moe_stream>(n_layer_all, n_slots, params.moe_stream_io_threads, params.moe_stream_direct);
+            pimpl->moe_stream = std::make_unique<llama_moe_stream>(
+                    n_layer_all,
+                    n_slots,
+                    params.moe_stream_io_threads,
+                    params.moe_stream_direct,
+                    full_cache_test);
             LLAMA_LOG_INFO("%s: MoE expert SSD streaming enabled, %u of %u experts cached per layer, %d I/O threads\n",
                     __func__, n_slots, hparams.n_expert, pimpl->moe_stream->n_io_threads);
         }
@@ -2130,12 +2139,6 @@ bool llama_model::has_tensor_overrides() const {
 
 llama_moe_stream * llama_model::moe_stream() const {
     return pimpl->moe_stream.get();
-}
-
-void llama_moe_stream_print_stats(const llama_model * model) {
-    if (model && model->moe_stream()) {
-        model->moe_stream()->print_stats();
-    }
 }
 
 const ggml_tensor * llama_model::get_tensor(const char * name) const {

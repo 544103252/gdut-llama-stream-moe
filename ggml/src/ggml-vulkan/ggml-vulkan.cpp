@@ -1860,7 +1860,6 @@ struct vk_context_struct {
 
     vk_command_pool * p {};
     ggml_backend_vk_context * backend_ctx {};
-    int32_t submit_gap_query_end = -1;
     bool moe_stream_group_conditional_active {};
 };
 typedef std::shared_ptr<vk_context_struct> vk_context;
@@ -2156,34 +2155,25 @@ struct vk_moe_stream_cache_state {
     bool plan_pending {};
     bool pending_graph_plan {};
     bool pending_slow_path {};
-    bool commit_timing_pending {};
     bool continuous_active {};
     bool continuous_recording {};
+    bool continuous_profile {};
     bool pending_continuous_plan {};
     int32_t continuous_miss_layer = -1;
     uint64_t continuous_skip_tail_ns {};
     int32_t continuous_capture_layer = -1;
     size_t continuous_resume_plan = 0;
-    uint32_t continuous_window_index {};
-    uint32_t continuous_window_count {};
     bool continuous_submit_profile_active {};
-    int64_t continuous_graph_start_us {};
     int64_t continuous_first_submit_end_us {};
-    int64_t continuous_submit_front_us {};
     int64_t continuous_record_tail_us {};
-    int64_t continuous_vk_submit_us {};
     size_t continuous_graph_calls {};
-    size_t continuous_vk_submit_calls {};
-    uint32_t continuous_submit_gap_query_next {};
-    bool continuous_submit_gap_pending {};
-    uint64_t continuous_submit_gap_ns {};
-    size_t continuous_submit_gap_count {};
     bool continuous_resume_submit_pending {};
     int64_t continuous_resume_submit_start_us {};
     int64_t continuous_resume_submit_us {};
     size_t continuous_resume_submit_count {};
     std::vector<std::pair<int32_t, int64_t>> continuous_planner_calls;
     std::vector<std::pair<vk_command_buffer *, int32_t>> continuous_commands;
+    std::vector<vk_buffer> continuous_retired_scratch;
     int32_t rolling_lookahead {};
     bool rolling_defer_submissions {};
     bool rolling_replay_active {};
@@ -2239,6 +2229,9 @@ struct vk_moe_stream_cache_state {
         ggml_vk_destroy_buffer(plan_meta);
         ggml_vk_destroy_buffer(plan_meta_readback);
         ggml_vk_destroy_buffer(rolling_plan_meta_readback);
+        for (auto & buffer : continuous_retired_scratch) {
+            ggml_vk_destroy_buffer(buffer);
+        }
     }
 };
 
@@ -2313,14 +2306,8 @@ struct ggml_backend_vk_context {
     std::unique_ptr<vk_perf_logger> perf_logger;
 
     vk_moe_stream_cache_state moe_stream_cache;
-    vk::QueryPool moe_stream_query_pool;
-    vk::QueryPool moe_stream_commit_query_pool;
     vk::QueryPool moe_stream_continuous_query_pool;
     uint32_t moe_stream_continuous_query_count {};
-    vk::QueryPool moe_stream_window_query_pool;
-    uint32_t moe_stream_window_query_count {};
-    vk::QueryPool moe_stream_submit_gap_query_pool;
-    uint32_t moe_stream_submit_gap_query_count {};
     vk::Semaphore moe_stream_rolling_semaphore;
     uint64_t moe_stream_rolling_semaphore_value {};
     vk::QueryPool query_pool;
@@ -3105,7 +3092,6 @@ static void ggml_vk_submit(vk_context& ctx, vk::Fence fence) {
     const bool profile_submit = backend_ctx != nullptr &&
             !ctx->p->q->transfer_only &&
             backend_ctx->moe_stream_cache.continuous_submit_profile_active;
-    const int64_t submit_start_us = profile_submit ? ggml_time_us() : 0;
     {
         std::lock_guard<std::mutex> guard(queue_mutex);
         ctx->p->q->queue.submit(submit_infos, fence);
@@ -3113,11 +3099,8 @@ static void ggml_vk_submit(vk_context& ctx, vk::Fence fence) {
     if (profile_submit) {
         auto & cache = backend_ctx->moe_stream_cache;
         const int64_t submit_end_us = ggml_time_us();
-        cache.continuous_vk_submit_us += submit_end_us - submit_start_us;
-        cache.continuous_vk_submit_calls++;
         if (cache.continuous_first_submit_end_us == 0) {
             cache.continuous_first_submit_end_us = submit_end_us;
-            cache.continuous_submit_front_us += submit_end_us - cache.continuous_graph_start_us;
         }
     }
 
@@ -7877,15 +7860,6 @@ static void ggml_vk_ctx_end(vk_context& ctx) {
         ctx->moe_stream_group_conditional_active = false;
     }
 
-    if (ctx->submit_gap_query_end >= 0) {
-        auto * backend_ctx = ctx->backend_ctx;
-        GGML_ASSERT(backend_ctx != nullptr);
-        ctx->s->buffer->buf.writeTimestamp(
-                vk::PipelineStageFlagBits::eAllCommands,
-                backend_ctx->moe_stream_submit_gap_query_pool,
-                (uint32_t) ctx->submit_gap_query_end);
-        ctx->submit_gap_query_end = -1;
-    }
     ctx->s->buffer->buf.end();
     ctx->s = nullptr;
 }
@@ -7898,23 +7872,7 @@ static void ggml_vk_ctx_begin(vk_device& device, vk_context& subctx, bool one_ti
 
     subctx->seqs.push_back({ ggml_vk_begin_submission(device, *subctx->p, one_time) });
     subctx->s = subctx->seqs[subctx->seqs.size() - 1].data();
-    subctx->submit_gap_query_end = -1;
     subctx->moe_stream_group_conditional_active = false;
-    auto * backend_ctx = subctx->backend_ctx;
-    if (backend_ctx != nullptr && !subctx->p->q->transfer_only &&
-            backend_ctx->moe_stream_cache.continuous_submit_profile_active &&
-            backend_ctx->moe_stream_cache.rolling_lookahead == 0) {
-        auto & cache = backend_ctx->moe_stream_cache;
-        GGML_ASSERT(backend_ctx->moe_stream_submit_gap_query_pool != nullptr);
-        GGML_ASSERT(cache.continuous_submit_gap_query_next + 2 <=
-                backend_ctx->moe_stream_submit_gap_query_count);
-        const uint32_t start_query = cache.continuous_submit_gap_query_next++;
-        subctx->submit_gap_query_end = (int32_t) cache.continuous_submit_gap_query_next++;
-        subctx->s->buffer->buf.writeTimestamp(
-                vk::PipelineStageFlagBits::eAllCommands,
-                backend_ctx->moe_stream_submit_gap_query_pool,
-                start_query);
-    }
 }
 
 static vk_context ggml_vk_get_compute_ctx(ggml_backend_vk_context * ctx) {
@@ -14685,7 +14643,8 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
     GGML_ABORT("fatal error");
 #endif
 
-    if (subctx) {
+    const bool retain_scratch = ctx->moe_stream_cache.continuous_active;
+    if (subctx && !retain_scratch) {
         // Submit and wait for any pending work before reallocating the buffers
         ggml_vk_ctx_end(subctx);
         ggml_vk_submit(subctx, {});
@@ -14696,11 +14655,20 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
         ctx->compute_ctx = subctx;
     }
 
+    const auto release_scratch = [&](vk_buffer & buffer) {
+        if (retain_scratch) {
+            // Recorded and replayable commands still reference the old allocation.
+            ctx->moe_stream_cache.continuous_retired_scratch.push_back(std::move(buffer));
+        } else {
+            ggml_vk_destroy_buffer(buffer);
+        }
+    };
+
     if (ctx->prealloc_x == nullptr || (ctx->prealloc_size_x > 0 && ctx->prealloc_x->size < ctx->prealloc_size_x)) {
         VK_LOG_MEMORY("ggml_vk_preallocate_buffers(x_size: " << ctx->prealloc_size_x << ")");
         // Resize buffer
         if (ctx->prealloc_x != nullptr) {
-            ggml_vk_destroy_buffer(ctx->prealloc_x);
+            release_scratch(ctx->prealloc_x);
         }
         ctx->prealloc_x = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_x);
     }
@@ -14708,7 +14676,7 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
         VK_LOG_MEMORY("ggml_vk_preallocate_buffers(y_size: " << ctx->prealloc_size_y << ")");
         // Resize buffer
         if (ctx->prealloc_y != nullptr) {
-            ggml_vk_destroy_buffer(ctx->prealloc_y);
+            release_scratch(ctx->prealloc_y);
         }
         ctx->prealloc_y = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_y);
         ctx->prealloc_y_last_pipeline_used = nullptr;
@@ -14719,7 +14687,7 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
         VK_LOG_MEMORY("ggml_vk_preallocate_buffers(split_k_size: " << ctx->prealloc_size_split_k << ")");
         // Resize buffer
         if (ctx->prealloc_split_k != nullptr) {
-            ggml_vk_destroy_buffer(ctx->prealloc_split_k);
+            release_scratch(ctx->prealloc_split_k);
         }
         ctx->prealloc_split_k = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_split_k);
     }
@@ -14727,7 +14695,7 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
         VK_LOG_MEMORY("ggml_vk_preallocate_buffers(add_partials_size: " << ctx->prealloc_add_rms_partials << ")");
         // Resize buffer
         if (ctx->prealloc_add_rms_partials != nullptr) {
-            ggml_vk_destroy_buffer(ctx->prealloc_add_rms_partials);
+            release_scratch(ctx->prealloc_add_rms_partials);
         }
         ctx->prealloc_add_rms_partials = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_add_rms_partials);
     }
@@ -14752,10 +14720,12 @@ static void ggml_vk_moe_stream_begin_conditional(
     auto & cache = ctx->moe_stream_cache;
     compute_ctx->s->buffer->buf.pipelineBarrier(
             vk::PipelineStageFlagBits::eComputeShader,
-            vk::PipelineStageFlagBits::eConditionalRenderingEXT,
+            vk::PipelineStageFlagBits::eConditionalRenderingEXT |
+                    vk::PipelineStageFlagBits::eComputeShader,
             {},
             { { vk::AccessFlagBits::eShaderWrite,
-                vk::AccessFlagBits::eConditionalRenderingReadEXT } },
+                vk::AccessFlagBits::eConditionalRenderingReadEXT |
+                        vk::AccessFlagBits::eShaderRead } },
             {}, {});
 
     VkConditionalRenderingBeginInfoEXT begin_info {};
@@ -15301,18 +15271,14 @@ static bool ggml_vk_build_graph(
         ggml_vk_moe_stream_end_conditional(ctx, compute_ctx);
     }
 
-    if (ctx->moe_stream_cache.continuous_recording && last_node) {
+    if (ctx->moe_stream_cache.continuous_recording &&
+            ctx->moe_stream_cache.continuous_profile && last_node) {
         GGML_ASSERT(ctx->moe_stream_continuous_query_pool != nullptr);
         GGML_ASSERT(ctx->moe_stream_continuous_query_count > 0);
         compute_ctx->s->buffer->buf.writeTimestamp(
                 vk::PipelineStageFlagBits::eAllCommands,
                 ctx->moe_stream_continuous_query_pool,
                 ctx->moe_stream_continuous_query_count - 1);
-        GGML_ASSERT(ctx->moe_stream_window_query_pool != nullptr);
-        compute_ctx->s->buffer->buf.writeTimestamp(
-                vk::PipelineStageFlagBits::eAllCommands,
-                ctx->moe_stream_window_query_pool,
-                2 * ctx->moe_stream_cache.continuous_window_index + 1);
     }
 
     ctx->tensor_ctxs[node_idx] = compute_ctx;
@@ -15891,28 +15857,10 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
 
     ctx->device->device.destroyFence(ctx->fence);
     ctx->device->device.destroyFence(ctx->almost_ready_fence);
-    if (ctx->moe_stream_query_pool) {
-        ctx->device->device.destroyQueryPool(ctx->moe_stream_query_pool);
-        ctx->moe_stream_query_pool = nullptr;
-    }
-    if (ctx->moe_stream_commit_query_pool) {
-        ctx->device->device.destroyQueryPool(ctx->moe_stream_commit_query_pool);
-        ctx->moe_stream_commit_query_pool = nullptr;
-    }
     if (ctx->moe_stream_continuous_query_pool) {
         ctx->device->device.destroyQueryPool(ctx->moe_stream_continuous_query_pool);
         ctx->moe_stream_continuous_query_pool = nullptr;
         ctx->moe_stream_continuous_query_count = 0;
-    }
-    if (ctx->moe_stream_window_query_pool) {
-        ctx->device->device.destroyQueryPool(ctx->moe_stream_window_query_pool);
-        ctx->moe_stream_window_query_pool = nullptr;
-        ctx->moe_stream_window_query_count = 0;
-    }
-    if (ctx->moe_stream_submit_gap_query_pool) {
-        ctx->device->device.destroyQueryPool(ctx->moe_stream_submit_gap_query_pool);
-        ctx->moe_stream_submit_gap_query_pool = nullptr;
-        ctx->moe_stream_submit_gap_query_count = 0;
     }
     if (ctx->moe_stream_rolling_semaphore) {
         ctx->device->device.destroySemaphore(ctx->moe_stream_rolling_semaphore);
@@ -17030,28 +16978,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     const bool moe_stream_continuous = moe_stream_cache.continuous_recording;
     const bool moe_stream_rolling_continuation = moe_stream_continuous &&
             moe_stream_cache.rolling_continuation_recording;
-    if (moe_stream_continuous) {
+    if (moe_stream_continuous && moe_stream_cache.continuous_profile) {
         GGML_ASSERT(!moe_stream_cache.continuous_submit_profile_active);
         moe_stream_cache.continuous_submit_profile_active = true;
-        moe_stream_cache.continuous_graph_start_us = ggml_time_us();
         moe_stream_cache.continuous_first_submit_end_us = 0;
-        const size_t submit_gap_query_count = 2 * ((size_t) cgraph->n_nodes + 16);
-        GGML_ASSERT(submit_gap_query_count <= UINT32_MAX);
-        if (!ctx->moe_stream_submit_gap_query_pool ||
-                ctx->moe_stream_submit_gap_query_count < submit_gap_query_count) {
-            if (ctx->moe_stream_submit_gap_query_pool) {
-                ctx->device->device.destroyQueryPool(ctx->moe_stream_submit_gap_query_pool);
-            }
-            vk::QueryPoolCreateInfo query_create_info;
-            query_create_info.queryType = vk::QueryType::eTimestamp;
-            query_create_info.queryCount = (uint32_t) submit_gap_query_count;
-            ctx->moe_stream_submit_gap_query_pool = ctx->device->device.createQueryPool(query_create_info);
-            ctx->moe_stream_submit_gap_query_count = query_create_info.queryCount;
-        }
-        ctx->device->device.resetQueryPool(
-                ctx->moe_stream_submit_gap_query_pool, 0, ctx->moe_stream_submit_gap_query_count);
-        moe_stream_cache.continuous_submit_gap_query_next = 0;
-        moe_stream_cache.continuous_submit_gap_pending = false;
     }
 
     if (vk_instance.debug_utils_support) {
@@ -17115,15 +17045,6 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     ctx->prealloc_y_last_tensor_used = nullptr;
     ctx->prealloc_y_last_decode_vector_staging = false;
 
-    if (moe_stream_continuous && !moe_stream_rolling_continuation) {
-        GGML_ASSERT(ctx->moe_stream_window_query_pool != nullptr);
-        compute_ctx = ggml_vk_get_compute_ctx(ctx);
-        compute_ctx->s->buffer->buf.writeTimestamp(
-                vk::PipelineStageFlagBits::eAllCommands,
-                ctx->moe_stream_window_query_pool,
-                2 * ctx->moe_stream_cache.continuous_window_index);
-    }
-
     if (ctx->prealloc_size_add_rms_partials) {
         ggml_vk_preallocate_buffers(ctx, nullptr);
         compute_ctx = ggml_vk_get_compute_ctx(ctx);
@@ -17141,19 +17062,6 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
     bool moe_stream_guarded = moe_stream_rolling_continuation &&
             moe_stream_cache.rolling_continuation_guarded;
-    if (!moe_stream_continuous && cgraph->nodes[last_node]->op == GGML_OP_MOE_STREAM_CACHE_DECIDE) {
-        if (!ctx->moe_stream_query_pool) {
-            vk::QueryPoolCreateInfo query_create_info;
-            query_create_info.queryType = vk::QueryType::eTimestamp;
-            query_create_info.queryCount = 3;
-            ctx->moe_stream_query_pool = ctx->device->device.createQueryPool(query_create_info);
-        }
-        ctx->device->device.resetQueryPool(ctx->moe_stream_query_pool, 0, 3);
-        compute_ctx = ggml_vk_get_compute_ctx(ctx);
-        compute_ctx->s->buffer->buf.writeTimestamp(
-                vk::PipelineStageFlagBits::eAllCommands, ctx->moe_stream_query_pool, 0);
-    }
-
     // Submit after enough work has accumulated, to overlap CPU cmdbuffer generation with GPU execution.
     // Estimate the amount of compute work using flops, and submit every 200 GFLOP
     // (and scaled down based on total graph flops, so smaller models submit earlier).
@@ -17520,8 +17428,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     }
 
     if (moe_stream_continuous) {
-        const int64_t graph_end_us = ggml_time_us();
-        if (moe_stream_cache.rolling_lookahead > 0) {
+        const int64_t graph_end_us = moe_stream_cache.continuous_profile ? ggml_time_us() : 0;
+        if (moe_stream_cache.rolling_worker.joinable()) {
             {
                 std::lock_guard<std::mutex> lock(moe_stream_cache.rolling_mutex);
                 moe_stream_cache.rolling_recording_done = true;
@@ -17529,18 +17437,16 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             moe_stream_cache.rolling_cv.notify_all();
             moe_stream_cache.rolling_worker.join();
         }
-        if (moe_stream_cache.continuous_first_submit_end_us == 0 ||
-                moe_stream_cache.continuous_first_submit_end_us >= graph_end_us) {
-            moe_stream_cache.continuous_submit_front_us +=
-                    graph_end_us - moe_stream_cache.continuous_graph_start_us;
-        } else {
+        if (moe_stream_cache.continuous_profile &&
+                moe_stream_cache.continuous_first_submit_end_us > 0 &&
+                moe_stream_cache.continuous_first_submit_end_us < graph_end_us) {
             moe_stream_cache.continuous_record_tail_us +=
                     graph_end_us - moe_stream_cache.continuous_first_submit_end_us;
         }
-        moe_stream_cache.continuous_graph_calls++;
+        if (moe_stream_cache.continuous_profile) {
+            moe_stream_cache.continuous_graph_calls++;
+        }
         moe_stream_cache.continuous_submit_profile_active = false;
-        moe_stream_cache.continuous_submit_gap_pending =
-                moe_stream_cache.continuous_submit_gap_query_next >= 2;
     }
 
     return GGML_STATUS_SUCCESS;
@@ -19046,8 +18952,7 @@ static bool ggml_vk_moe_stream_dispatch(
         uint32_t n_selected,
         uint32_t mode,
         uint32_t decay = 0,
-        bool synchronize = true,
-        vk::QueryPool timing_query_pool = nullptr) {
+        bool synchronize = true) {
     auto & cache = ctx->moe_stream_cache;
     vk_pipeline pipeline = ctx->device->pipeline_moe_stream_cache_plan;
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
@@ -19062,10 +18967,6 @@ static bool ggml_vk_moe_stream_dispatch(
     };
 
     vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
-    if (timing_query_pool) {
-        compute_ctx->s->buffer->buf.writeTimestamp(
-                vk::PipelineStageFlagBits::eAllCommands, timing_query_pool, 0);
-    }
     ggml_vk_dispatch_pipeline(ctx, compute_ctx, pipeline, {
         ggml_vk_moe_stream_buffer_info(cache.selected),
         ggml_vk_moe_stream_buffer_info(layer.expert_map),
@@ -19090,10 +18991,6 @@ static bool ggml_vk_moe_stream_dispatch(
                 { { vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite,
                     vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite } },
                 {}, {});
-    }
-    if (timing_query_pool) {
-        compute_ctx->s->buffer->buf.writeTimestamp(
-                vk::PipelineStageFlagBits::eAllCommands, timing_query_pool, 1);
     }
     if (synchronize) {
         ggml_vk_synchronize(ctx);
@@ -19135,10 +19032,6 @@ static bool ggml_vk_moe_stream_cache_decide(
     }
     const bool decay = cache.hot_decay_interval > 0 &&
             cache.n_calls % cache.hot_decay_interval == 0;
-    if (!cache.continuous_recording) {
-        compute_ctx->s->buffer->buf.writeTimestamp(
-                vk::PipelineStageFlagBits::eAllCommands, ctx->moe_stream_query_pool, 1);
-    }
     if (decay) {
         for (size_t i = 0; i < cache.layers.size(); ++i) {
             auto & other = cache.layers[i];
@@ -19200,16 +19093,13 @@ static bool ggml_vk_moe_stream_cache_decide(
             compute_ctx,
             cache,
             cache.rolling_lookahead > 0 ? cache.continuous_planner_calls.size() - 1 : SIZE_MAX);
-    if (cache.continuous_recording) {
+    if (cache.continuous_recording && cache.continuous_profile) {
         GGML_ASSERT(ctx->moe_stream_continuous_query_pool != nullptr);
         GGML_ASSERT(continuous_query_index + 1 < ctx->moe_stream_continuous_query_count);
         compute_ctx->s->buffer->buf.writeTimestamp(
                 vk::PipelineStageFlagBits::eAllCommands,
                 ctx->moe_stream_continuous_query_pool,
                 (uint32_t) continuous_query_index);
-    } else {
-        compute_ctx->s->buffer->buf.writeTimestamp(
-                vk::PipelineStageFlagBits::eAllCommands, ctx->moe_stream_query_pool, 2);
     }
     return true;
 }
@@ -19273,43 +19163,7 @@ static bool ggml_backend_vk_prepare_moe_stream_cache(
     int32_t meta[VK_MOE_STREAM_META_COUNT] = {};
     GGML_ASSERT(cache.plan_meta_readback != nullptr && cache.plan_meta_readback->ptr != nullptr);
     memcpy(meta, cache.plan_meta_readback->ptr, sizeof(meta));
-    plan->t_gpu_segment_ns = 0;
-    plan->t_gpu_planner_ns = 0;
     plan->t_gpu_skip_tail_ns = continuous_plan ? cache.continuous_skip_tail_ns : 0;
-    plan->t_gpu_commit_carry_ns = 0;
-    plan->n_gpu_commit_carry = 0;
-    if (graph_prepared && cache.commit_timing_pending) {
-        uint64_t timestamps[2] = {};
-        VK_CHECK(ctx->device->device.getQueryPoolResults(
-                ctx->moe_stream_commit_query_pool,
-                0,
-                2,
-                sizeof(timestamps),
-                timestamps,
-                sizeof(timestamps[0]),
-                vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait),
-                "get Stream MoE commit timestamp results");
-        plan->t_gpu_commit_carry_ns = (uint64_t) ((timestamps[1] - timestamps[0]) *
-                ctx->device->properties.limits.timestampPeriod);
-        plan->n_gpu_commit_carry = 1;
-        cache.commit_timing_pending = false;
-    }
-    if (graph_prepared && !continuous_plan) {
-        uint64_t timestamps[3] = {};
-        VK_CHECK(ctx->device->device.getQueryPoolResults(
-                ctx->moe_stream_query_pool,
-                0,
-                3,
-                sizeof(timestamps),
-                timestamps,
-                sizeof(timestamps[0]),
-                vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait),
-                "get Stream MoE planner timestamp results");
-        plan->t_gpu_segment_ns = (uint64_t) ((timestamps[2] - timestamps[0]) *
-                ctx->device->properties.limits.timestampPeriod);
-        plan->t_gpu_planner_ns = (uint64_t) ((timestamps[2] - timestamps[1]) *
-                ctx->device->properties.limits.timestampPeriod);
-    }
     if (meta[0] != 0 || meta[1] < 0 || meta[1] > (int32_t) layer.n_expert ||
             meta[2] < 0 || meta[2] > (int32_t) layer.n_expert ||
             meta[4] < 0 || meta[4] > (int32_t) layer.n_expert ||
@@ -19388,21 +19242,8 @@ static bool ggml_backend_vk_commit_moe_stream_cache(ggml_backend_t backend, int 
     bool committed = true;
     if (cache.pending_slow_path) {
         auto & layer = cache.layers[layer_id];
-        vk::QueryPool timing_query_pool = nullptr;
-        if (cache.pending_graph_plan) {
-            GGML_ASSERT(!cache.commit_timing_pending);
-            if (!ctx->moe_stream_commit_query_pool) {
-                vk::QueryPoolCreateInfo query_create_info;
-                query_create_info.queryType = vk::QueryType::eTimestamp;
-                query_create_info.queryCount = 2;
-                ctx->moe_stream_commit_query_pool = ctx->device->device.createQueryPool(query_create_info);
-            }
-            ctx->device->device.resetQueryPool(ctx->moe_stream_commit_query_pool, 0, 2);
-            timing_query_pool = ctx->moe_stream_commit_query_pool;
-        }
         ggml_vk_moe_stream_dispatch(
-                ctx, layer, layer_id, 0, 1, 0, !cache.pending_graph_plan, timing_query_pool);
-        cache.commit_timing_pending = cache.pending_graph_plan;
+                ctx, layer, layer_id, 0, 1, 0, !cache.pending_graph_plan);
 
         if (!cache.pending_graph_plan) {
             std::vector<int32_t> expert_map(layer.n_expert);
@@ -19534,7 +19375,7 @@ static bool ggml_vk_moe_stream_begin_rolling_continuation(
 }
 
 static bool ggml_backend_vk_moe_stream_continuous_begin(
-        ggml_backend_t backend, bool sequence_continuation, int32_t rolling_lookahead) {
+        ggml_backend_t backend, int32_t rolling_lookahead, bool profile) {
     if (!ggml_backend_is_vk(backend)) {
         return false;
     }
@@ -19548,57 +19389,32 @@ static bool ggml_backend_vk_moe_stream_continuous_begin(
     if (cache.rolling_worker.joinable()) {
         return false;
     }
-    const size_t query_count = cache.layers.size() + 2;
-    const size_t window_query_count = 2 * cache.layers.size();
-    if (query_count > UINT32_MAX || window_query_count > UINT32_MAX || window_query_count == 0) {
-        return false;
-    }
-    if (!ctx->moe_stream_continuous_query_pool ||
-            ctx->moe_stream_continuous_query_count < query_count) {
-        if (ctx->moe_stream_continuous_query_pool) {
-            ctx->device->device.destroyQueryPool(ctx->moe_stream_continuous_query_pool);
+    if (profile) {
+        const size_t query_count = cache.layers.size() + 2;
+        if (query_count > UINT32_MAX) {
+            return false;
         }
-        vk::QueryPoolCreateInfo query_create_info;
-        query_create_info.queryType = vk::QueryType::eTimestamp;
-        query_create_info.queryCount = (uint32_t) query_count;
-        ctx->moe_stream_continuous_query_pool = ctx->device->device.createQueryPool(query_create_info);
-        ctx->moe_stream_continuous_query_count = query_create_info.queryCount;
-    }
-    if (!ctx->moe_stream_window_query_pool ||
-            ctx->moe_stream_window_query_count < window_query_count) {
-        if (ctx->moe_stream_window_query_pool) {
-            ctx->device->device.destroyQueryPool(ctx->moe_stream_window_query_pool);
+        if (!ctx->moe_stream_continuous_query_pool ||
+                ctx->moe_stream_continuous_query_count < query_count) {
+            if (ctx->moe_stream_continuous_query_pool) {
+                ctx->device->device.destroyQueryPool(ctx->moe_stream_continuous_query_pool);
+            }
+            vk::QueryPoolCreateInfo query_create_info;
+            query_create_info.queryType = vk::QueryType::eTimestamp;
+            query_create_info.queryCount = (uint32_t) query_count;
+            ctx->moe_stream_continuous_query_pool = ctx->device->device.createQueryPool(query_create_info);
+            ctx->moe_stream_continuous_query_count = query_create_info.queryCount;
         }
-        vk::QueryPoolCreateInfo query_create_info;
-        query_create_info.queryType = vk::QueryType::eTimestamp;
-        query_create_info.queryCount = (uint32_t) window_query_count;
-        ctx->moe_stream_window_query_pool = ctx->device->device.createQueryPool(query_create_info);
-        ctx->moe_stream_window_query_count = query_create_info.queryCount;
-    }
-    ctx->device->device.resetQueryPool(
-            ctx->moe_stream_continuous_query_pool, 0, ctx->moe_stream_continuous_query_count);
-    if (!sequence_continuation) {
         ctx->device->device.resetQueryPool(
-                ctx->moe_stream_window_query_pool, 0, ctx->moe_stream_window_query_count);
-        cache.continuous_window_count = 0;
-        cache.continuous_submit_front_us = 0;
-        cache.continuous_record_tail_us = 0;
-        cache.continuous_vk_submit_us = 0;
-        cache.continuous_graph_calls = 0;
-        cache.continuous_vk_submit_calls = 0;
-        cache.continuous_submit_gap_ns = 0;
-        cache.continuous_submit_gap_count = 0;
-        cache.continuous_resume_submit_pending = false;
-        cache.continuous_resume_submit_start_us = 0;
-        cache.continuous_resume_submit_us = 0;
-        cache.continuous_resume_submit_count = 0;
-    } else if (cache.continuous_window_count == 0) {
-        return false;
+                ctx->moe_stream_continuous_query_pool, 0, ctx->moe_stream_continuous_query_count);
     }
-    if (cache.continuous_window_count >= cache.layers.size()) {
-        return false;
-    }
-    cache.continuous_window_index = cache.continuous_window_count++;
+    cache.continuous_profile = profile;
+    cache.continuous_record_tail_us = 0;
+    cache.continuous_graph_calls = 0;
+    cache.continuous_resume_submit_pending = false;
+    cache.continuous_resume_submit_start_us = 0;
+    cache.continuous_resume_submit_us = 0;
+    cache.continuous_resume_submit_count = 0;
     cache.continuous_active = true;
     cache.rolling_lookahead = rolling_lookahead;
     cache.rolling_carried_hit_plans = 0;
@@ -19616,6 +19432,10 @@ static bool ggml_backend_vk_moe_stream_continuous_wait(ggml_backend_t backend) {
     }
     auto & cache = ctx->moe_stream_cache;
     if (cache.rolling_worker.joinable()) {
+        {
+            std::lock_guard<std::mutex> lock(cache.rolling_mutex);
+            cache.rolling_recording_done = true;
+        }
         cache.rolling_cv.notify_all();
         cache.rolling_worker.join();
     }
@@ -19639,31 +19459,6 @@ static bool ggml_backend_vk_moe_stream_continuous_wait(ggml_backend_t backend) {
         }
     }
     ggml_vk_synchronize(ctx);
-    if (cache.continuous_submit_gap_pending && cache.rolling_lookahead == 0) {
-        std::vector<uint64_t> timestamps(cache.continuous_submit_gap_query_next);
-        VK_CHECK(ctx->device->device.getQueryPoolResults(
-                ctx->moe_stream_submit_gap_query_pool,
-                0,
-                cache.continuous_submit_gap_query_next,
-                timestamps.size() * sizeof(uint64_t),
-                timestamps.data(),
-                sizeof(uint64_t),
-                vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait),
-                "get Stream MoE submit gap timestamps");
-        const double timestamp_period = ctx->device->properties.limits.timestampPeriod;
-        const size_t n_command_buffers = timestamps.size() / 2;
-        for (size_t i = 1; i < n_command_buffers; ++i) {
-            const uint64_t previous_end = timestamps[2 * i - 1];
-            const uint64_t current_start = timestamps[2 * i];
-            if (current_start >= previous_end) {
-                cache.continuous_submit_gap_ns +=
-                        (uint64_t) ((current_start - previous_end) * timestamp_period);
-                cache.continuous_submit_gap_count++;
-            }
-        }
-        cache.continuous_submit_gap_pending = false;
-    }
-    cache.continuous_submit_gap_pending = false;
     cache.continuous_recording = false;
     cache.rolling_replay_active = false;
     return true;
@@ -19679,8 +19474,8 @@ static bool ggml_backend_vk_moe_stream_continuous_resume(ggml_backend_t backend,
             cache.pending_continuous_plan) {
         return false;
     }
-    cache.continuous_resume_submit_start_us = ggml_time_us();
-    cache.continuous_resume_submit_pending = true;
+    cache.continuous_resume_submit_start_us = cache.continuous_profile ? ggml_time_us() : 0;
+    cache.continuous_resume_submit_pending = cache.continuous_profile;
     size_t plan_index = cache.continuous_planner_calls.size();
     for (size_t i = 0; i < cache.continuous_planner_calls.size(); ++i) {
         if (cache.continuous_planner_calls[i].first == layer_id) {
@@ -19702,19 +19497,10 @@ static bool ggml_backend_vk_moe_stream_continuous_resume(ggml_backend_t backend,
     }
     cache.continuous_resume_plan = plan_index + 1;
     cache.continuous_skip_tail_ns = 0;
-    ctx->device->device.resetQueryPool(
-            ctx->moe_stream_continuous_query_pool, 0, ctx->moe_stream_continuous_query_count);
-    ctx->device->device.resetQueryPool(
-            ctx->moe_stream_window_query_pool,
-            2 * cache.continuous_window_index + 1,
-            1);
-    if (ctx->moe_stream_submit_gap_query_pool && cache.continuous_submit_gap_query_next > 0) {
+    if (cache.continuous_profile) {
         ctx->device->device.resetQueryPool(
-                ctx->moe_stream_submit_gap_query_pool,
-                0,
-                cache.continuous_submit_gap_query_next);
+                ctx->moe_stream_continuous_query_pool, 0, ctx->moe_stream_continuous_query_count);
     }
-
     if (ggml_vk_submit_transfer_ctx(ctx)) {
         ctx->submit_pending = true;
     }
@@ -19799,7 +19585,8 @@ static bool ggml_backend_vk_moe_stream_continuous_status(
                     cache.continuous_planner_calls[plan_index].first != cache.rolling_miss_layer) {
                 return false;
             }
-            if (cache.rolling_last_submitted_plan != SIZE_MAX &&
+            if (cache.continuous_profile &&
+                    cache.rolling_last_submitted_plan != SIZE_MAX &&
                     cache.rolling_last_submitted_plan >= plan_index) {
                 uint64_t miss_timestamp = 0;
                 uint64_t end_timestamp = 0;
@@ -19870,29 +19657,31 @@ static bool ggml_backend_vk_moe_stream_continuous_status(
         cache.n_calls = cache.continuous_planner_calls.back().second;
         cache.continuous_resume_plan = cache.continuous_planner_calls.size();
     } else {
-        uint64_t miss_timestamp = 0;
-        uint64_t end_timestamp = 0;
-        VK_CHECK(ctx->device->device.getQueryPoolResults(
-                ctx->moe_stream_continuous_query_pool,
-                (uint32_t) plan_index + 1,
-                1,
-                sizeof(miss_timestamp),
-                &miss_timestamp,
-                sizeof(miss_timestamp),
-                vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait),
-                "get Stream MoE miss timestamp");
-        VK_CHECK(ctx->device->device.getQueryPoolResults(
-                ctx->moe_stream_continuous_query_pool,
-                ctx->moe_stream_continuous_query_count - 1,
-                1,
-                sizeof(end_timestamp),
-                &end_timestamp,
-                sizeof(end_timestamp),
-                vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait),
-                "get Stream MoE window-end timestamp");
-        if (end_timestamp >= miss_timestamp) {
-            cache.continuous_skip_tail_ns = (uint64_t) ((end_timestamp - miss_timestamp) *
-                    ctx->device->properties.limits.timestampPeriod);
+        if (cache.continuous_profile) {
+            uint64_t miss_timestamp = 0;
+            uint64_t end_timestamp = 0;
+            VK_CHECK(ctx->device->device.getQueryPoolResults(
+                    ctx->moe_stream_continuous_query_pool,
+                    (uint32_t) plan_index + 1,
+                    1,
+                    sizeof(miss_timestamp),
+                    &miss_timestamp,
+                    sizeof(miss_timestamp),
+                    vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait),
+                    "get Stream MoE miss timestamp");
+            VK_CHECK(ctx->device->device.getQueryPoolResults(
+                    ctx->moe_stream_continuous_query_pool,
+                    ctx->moe_stream_continuous_query_count - 1,
+                    1,
+                    sizeof(end_timestamp),
+                    &end_timestamp,
+                    sizeof(end_timestamp),
+                    vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait),
+                    "get Stream MoE window-end timestamp");
+            if (end_timestamp >= miss_timestamp) {
+                cache.continuous_skip_tail_ns = (uint64_t) ((end_timestamp - miss_timestamp) *
+                        ctx->device->properties.limits.timestampPeriod);
+            }
         }
         cache.n_calls = cache.continuous_planner_calls[plan_index].second;
         *miss_layer = layer_id;
@@ -19933,6 +19722,10 @@ static void ggml_backend_vk_moe_stream_continuous_end(ggml_backend_t backend) {
     cache.continuous_planner_calls.clear();
     cache.continuous_commands.clear();
     cache.rolling_lookahead = 0;
+    for (auto & buffer : cache.continuous_retired_scratch) {
+        ggml_vk_destroy_buffer(buffer);
+    }
+    cache.continuous_retired_scratch.clear();
     cache.rolling_defer_submissions = false;
     cache.rolling_replay_active = false;
     cache.rolling_miss_layer = -1;
@@ -19958,64 +19751,18 @@ static void ggml_backend_vk_moe_stream_continuous_end(ggml_backend_t backend) {
     cache.rolling_carried_hit_plans = 0;
     cache.rolling_accumulated_flops = 0;
     cache.continuous_resume_submit_pending = false;
+    cache.continuous_submit_profile_active = false;
+    cache.continuous_profile = false;
     ggml_vk_graph_cleanup(ctx);
-}
-
-static bool ggml_backend_vk_moe_stream_continuous_window_gaps(
-        ggml_backend_t backend, uint64_t * time_ns, size_t * n_gaps) {
-    if (!ggml_backend_is_vk(backend) || time_ns == nullptr || n_gaps == nullptr) {
-        return false;
-    }
-    auto * ctx = (ggml_backend_vk_context *) backend->context;
-    auto & cache = ctx->moe_stream_cache;
-    if (cache.continuous_active || !ctx->moe_stream_window_query_pool) {
-        return false;
-    }
-
-    *time_ns = 0;
-    *n_gaps = 0;
-    if (cache.continuous_window_count < 2) {
-        return true;
-    }
-
-    std::vector<uint64_t> timestamps(2 * cache.continuous_window_count);
-    VK_CHECK(ctx->device->device.getQueryPoolResults(
-            ctx->moe_stream_window_query_pool,
-            0,
-            (uint32_t) timestamps.size(),
-            timestamps.size() * sizeof(uint64_t),
-            timestamps.data(),
-            sizeof(uint64_t),
-            vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait),
-            "get Stream MoE window timestamps");
-
-    const double timestamp_period = ctx->device->properties.limits.timestampPeriod;
-    for (uint32_t i = 1; i < cache.continuous_window_count; ++i) {
-        const uint64_t previous_end = timestamps[2 * i - 1];
-        const uint64_t current_start = timestamps[2 * i];
-        if (current_start < previous_end) {
-            return false;
-        }
-        *time_ns += (uint64_t) ((current_start - previous_end) * timestamp_period);
-        (*n_gaps)++;
-    }
-    return true;
 }
 
 static bool ggml_backend_vk_moe_stream_continuous_submit_profile(
         ggml_backend_t backend,
-        int64_t * submit_front_us,
         int64_t * record_tail_us,
-        int64_t * vk_submit_us,
         size_t * graph_calls,
-        size_t * vk_submit_calls,
-        uint64_t * submit_gap_ns,
-        size_t * submit_gap_count,
         int64_t * resume_submit_us,
         size_t * resume_submit_count) {
-    if (!ggml_backend_is_vk(backend) || submit_front_us == nullptr || record_tail_us == nullptr ||
-            vk_submit_us == nullptr || graph_calls == nullptr || vk_submit_calls == nullptr ||
-            submit_gap_ns == nullptr || submit_gap_count == nullptr ||
+    if (!ggml_backend_is_vk(backend) || record_tail_us == nullptr || graph_calls == nullptr ||
             resume_submit_us == nullptr || resume_submit_count == nullptr) {
         return false;
     }
@@ -20024,13 +19771,8 @@ static bool ggml_backend_vk_moe_stream_continuous_submit_profile(
     if (cache.continuous_active || cache.continuous_submit_profile_active) {
         return false;
     }
-    *submit_front_us = cache.continuous_submit_front_us;
     *record_tail_us = cache.continuous_record_tail_us;
-    *vk_submit_us = cache.continuous_vk_submit_us;
     *graph_calls = cache.continuous_graph_calls;
-    *vk_submit_calls = cache.continuous_vk_submit_calls;
-    *submit_gap_ns = cache.continuous_submit_gap_ns;
-    *submit_gap_count = cache.continuous_submit_gap_count;
     *resume_submit_us = cache.continuous_resume_submit_us;
     *resume_submit_count = cache.continuous_resume_submit_count;
     return true;
@@ -20049,7 +19791,6 @@ static const ggml_backend_moe_stream_cache_ops * ggml_backend_vk_get_moe_stream_
         /* .continuous_resume = */ ggml_backend_vk_moe_stream_continuous_resume,
         /* .continuous_status = */ ggml_backend_vk_moe_stream_continuous_status,
         /* .continuous_end    = */ ggml_backend_vk_moe_stream_continuous_end,
-        /* .continuous_window_gaps = */ ggml_backend_vk_moe_stream_continuous_window_gaps,
         /* .continuous_submit_profile = */ ggml_backend_vk_moe_stream_continuous_submit_profile,
     };
     return &ops;

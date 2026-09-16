@@ -1563,9 +1563,6 @@ extern "C" {
     LLAMA_API void                           llama_perf_sampler_print(const struct llama_sampler * chain);
     LLAMA_API void                           llama_perf_sampler_reset(      struct llama_sampler * chain);
 
-    // print MoE expert streaming statistics (no-op when streaming is not enabled)
-    LLAMA_API void llama_moe_stream_print_stats(const struct llama_model * model);
-
     // reset and print per-conversation MoE expert cache statistics
     LLAMA_API void llama_moe_stream_stats_reset(      struct llama_context * ctx);
     LLAMA_API void llama_moe_stream_stats_print(const struct llama_context * ctx);

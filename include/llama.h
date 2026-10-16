@@ -324,10 +324,12 @@ extern "C" {
         uint64_t moe_stream_budget;     // total cache byte budget, used when slots == 0 (0 = auto heuristic)
         int32_t  moe_stream_io_threads; // expert load I/O threads (<= 0 = default)
         bool     moe_stream_direct;     // use O_DIRECT for expert reads (bypass page cache); falls back if unsupported
-        const char * moe_stream_policy; // "hotness" (default), "chain", or "moe-infinity"
+        const char * moe_stream_policy; // hotness (default), chain, moe-infinity, fate-hotness, fate-arc
         const char * moe_stream_eam; // versioned historical EAM collection
         const char * moe_stream_markov; // versioned Markov matrix file
         const char * moe_stream_trace;  // optional routing trace JSONL file
+        const char * moe_stream_stmoe_cct; // ST-MoE prediction-only calibration JSON
+        uint32_t moe_stream_shallow_layers; // Fate shallow MoE layer count (default: 4)
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights

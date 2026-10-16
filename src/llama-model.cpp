@@ -26,6 +26,7 @@
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
+#include <cinttypes>
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
@@ -1304,6 +1305,10 @@ static uint32_t llama_moe_stream_resolve_slots(
         return n_slots;
     }
 
+    if (n_slots >= hparams.n_expert && params.moe_stream_policy &&
+            (strcmp(params.moe_stream_policy, "fate-hotness") == 0 || strcmp(params.moe_stream_policy, "fate-arc") == 0)) {
+        return hparams.n_expert;
+    }
     if (n_slots >= hparams.n_expert) {
         LLAMA_LOG_WARN("%s: MoE expert cache of %u slots covers all %u experts -- streaming disabled, loading normally\n",
                 __func__, n_slots, hparams.n_expert);
@@ -1405,6 +1410,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     if (params.moe_stream) {
         const bool full_cache_test = std::getenv("LLAMA_MOE_STREAM_FULL_CACHE_TEST") != nullptr;
         const uint32_t n_slots = llama_moe_stream_resolve_slots(params, hparams, ml, full_cache_test);
+        if (!n_slots && params.moe_stream_stmoe_cct && *params.moe_stream_stmoe_cct) {
+            throw std::runtime_error("ST-MoE prediction testing requires streamed MoE layers");
+        }
         if (n_slots > 0) {
             if (pimpl->has_tensor_overrides) {
                 LLAMA_LOG_WARN("%s: tensor buffer overrides (-ot/--cpu-moe) do not apply to SSD-streamed expert tensors\n", __func__);
@@ -1415,9 +1423,68 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     params.moe_stream_io_threads,
                     params.moe_stream_direct,
                     full_cache_test);
-            pimpl->moe_stream->configure(params.moe_stream_policy, params.moe_stream_markov, params.moe_stream_trace, params.moe_stream_eam);
-            LLAMA_LOG_INFO("%s: MoE expert SSD streaming enabled, %u of %u experts cached per layer, %d I/O threads\n",
-                    __func__, n_slots, hparams.n_expert, pimpl->moe_stream->n_io_threads);
+            pimpl->moe_stream->configure(params.moe_stream_policy, params.moe_stream_markov, params.moe_stream_trace,
+                    params.moe_stream_eam, params.moe_stream_stmoe_cct);
+            auto & stream = *pimpl->moe_stream;
+            if (!stream.stmoe_path.empty()) {
+                stream.stmoe.k = hparams.n_expert_used;
+                for (const auto & item : ml.weights_map) {
+                    int il = -1;
+                    if (llama_moe_stream_is_exps_name(item.first) &&
+                            sscanf(item.first.c_str(), "blk.%d.", &il) == 1 &&
+                            il >= 0 && il < (int) hparams.n_layer()) {
+                        stream.stmoe_layers.push_back(il);
+                    }
+                }
+                std::sort(stream.stmoe_layers.begin(), stream.stmoe_layers.end());
+                stream.stmoe_layers.erase(std::unique(stream.stmoe_layers.begin(), stream.stmoe_layers.end()),
+                        stream.stmoe_layers.end());
+            }
+            if (stream.policy == llama_moe_stream_policy::fate_hotness || stream.policy == llama_moe_stream_policy::fate_arc) {
+                stream.shallow_layers = params.moe_stream_shallow_layers;
+                stream.layer_bytes.assign(n_layer_all, 0);
+                for (const auto & item : ml.weights_map) {
+                    const auto & name = item.first;
+                    const auto & w = item.second;
+                    int il = -1;
+                    if (llama_moe_stream_is_exps_name(name) && w.tensor->ne[2] == hparams.n_expert &&
+                            sscanf(name.c_str(), "blk.%d.", &il) == 1 && il >= 0 && il < n_layer_all) {
+                        stream.layer_bytes[il] += ggml_nbytes(w.tensor)/hparams.n_expert;
+                    }
+                }
+                uint64_t baseline_bytes = 0;
+                for (const auto bytes : stream.layer_bytes) { baseline_bytes += bytes*n_slots; }
+                stream.cache_budget = params.moe_stream_slots == 0 && params.moe_stream_budget > 0 ?
+                        params.moe_stream_budget : baseline_bytes;
+                stream.layer_slots = llama_moe_stream_fate_capacity(stream.layer_bytes, hparams.n_expert,
+                        std::min<uint32_t>(hparams.n_expert, 3*hparams.n_expert_used),
+                        stream.shallow_layers, stream.cache_budget);
+                uint64_t allocated = 0;
+                for (size_t il = 0; il < stream.layer_slots.size(); il++) {
+                    if (!stream.layer_bytes[il]) { continue; }
+                    allocated += stream.layer_bytes[il]*stream.layer_slots[il];
+                    LLAMA_LOG_INFO("moe_capacity layer=%zu slots=%u expert_bytes=%" PRIu64 "\n",
+                            il, stream.layer_slots[il], stream.layer_bytes[il]);
+                }
+                LLAMA_LOG_INFO("moe_capacity budget=%" PRIu64 " allocated=%" PRIu64 " shallow=%u\n",
+                        stream.cache_budget, allocated, stream.shallow_layers);
+                if (stream.trace.is_open()) {
+                    stream.trace << "{\"event\":\"capacity\",\"budget\":" << stream.cache_budget
+                                 << ",\"allocated\":" << allocated << ",\"shallow\":" << stream.shallow_layers
+                                 << ",\"slots\":[";
+                    for (size_t i = 0; i < stream.layer_slots.size(); i++) {
+                        stream.trace << (i ? "," : "") << stream.layer_slots[i];
+                    }
+                    stream.trace << "]}\n";
+                }
+            }
+            if (stream.layer_slots.empty()) {
+                LLAMA_LOG_INFO("%s: MoE expert SSD streaming enabled, %u of %u experts cached per layer, %d I/O threads\n",
+                        __func__, n_slots, hparams.n_expert, stream.n_io_threads);
+            } else {
+                LLAMA_LOG_INFO("%s: MoE expert SSD streaming enabled with Fate per-layer capacities, %d I/O threads\n",
+                        __func__, stream.n_io_threads);
+            }
         }
     }
 
@@ -2475,6 +2542,8 @@ llama_model_params llama_model_default_params() {
         /*.moe_stream_eam              =*/ nullptr,
         /*.moe_stream_markov           =*/ nullptr,
         /*.moe_stream_trace            =*/ nullptr,
+        /*.moe_stream_stmoe_cct        =*/ nullptr,
+        /*.moe_stream_shallow_layers   =*/ 4,
         /*.vocab_only                  =*/ false,
         /*.use_mmap                    =*/ true,
         /*.use_direct_io               =*/ false,

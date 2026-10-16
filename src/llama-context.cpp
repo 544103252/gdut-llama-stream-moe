@@ -1451,6 +1451,14 @@ llm_graph_result * llama_context::process_ubatch(
 
     if (auto * stream = model.moe_stream()) {
         stream->decode_phase = !moe_stats_prefill && ubatch.n_tokens == 1;
+        if (!stream->stmoe_path.empty()) {
+            if (ubatch.n_seqs_unq != 1 || (!moe_stats_prefill && ubatch.n_tokens != 1)) {
+                GGML_ABORT("ST-MoE requires single-sequence, single-token decode");
+            }
+            if (moe_stats_prefill && stream->stmoe.step) {
+                GGML_ABORT("ST-MoE requires a fresh process per sample; disable warmup");
+            }
+        }
         if (stream->policy == llama_moe_stream_policy::infinity) {
             if (ubatch.n_seqs_unq != 1) {
                 GGML_ABORT("moe-infinity requires a single sequence");
@@ -1458,7 +1466,14 @@ llm_graph_result * llama_context::process_ubatch(
             stream->begin_iteration();
         }
     }
+    const uint64_t stmoe_step = mstream ? mstream->stmoe.step : 0;
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (status == GGML_STATUS_SUCCESS && mstream && !mstream->stmoe_path.empty() && mstream->decode_phase) {
+        ggml_backend_sched_synchronize(sched.get());
+        if (mstream->stmoe.next != 0 || mstream->stmoe.step != stmoe_step + 1) {
+            GGML_ABORT("ST-MoE missing MoE layer observations at end of decode token");
+        }
+    }
 
     if (status == GGML_STATUS_SUCCESS && mstream && moe_stream_continuous) {
         mstream->record_continuous_hits(

@@ -592,6 +592,8 @@ struct common_params {
     std::string moe_stream_eam;
     std::string moe_stream_markov;
     std::string moe_stream_trace;
+    std::string moe_stream_stmoe_cct;
+    uint32_t moe_stream_shallow_layers = 4;
 
     bool single_turn       = false; // single turn chat conversation
 

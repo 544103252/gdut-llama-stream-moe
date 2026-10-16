@@ -2492,14 +2492,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_STREAM"));
     add_opt(common_arg(
-        {"--moe-stream-policy"}, "hotness|chain|moe-infinity",
+        {"--moe-stream-policy"}, "hotness|chain|moe-infinity|fate-hotness|fate-arc",
         "expert cache replacement policy (default: hotness)",
         [](common_params & params, const std::string & value) {
-            if (value != "hotness" && value != "chain" && value != "moe-infinity") {
-                throw std::invalid_argument("expected hotness, chain or moe-infinity");
+            if (value != "hotness" && value != "chain" && value != "moe-infinity" && value != "fate-hotness" && value != "fate-arc") {
+                throw std::invalid_argument("expected hotness, chain, moe-infinity, fate-hotness or fate-arc");
             }
             params.moe_stream_policy = value;
             params.moe_stream = true;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-shallow-layers"}, "N",
+        "number of shallow MoE layers for Fate cache allocation (default: 4)",
+        [](common_params & params, int value) {
+            if (value < 0) { throw std::invalid_argument("shallow layer count must be nonnegative"); }
+            params.moe_stream_shallow_layers = value;
         }
     ));
     add_opt(common_arg(
@@ -2515,6 +2523,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "offline Markov matrix for chain replacement",
         [](common_params & params, const std::string & value) {
             params.moe_stream_markov = value;
+            params.moe_stream = true;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-stmoe-cct"}, "PATH",
+        "ST-MoE prediction-only calibration JSON (single-sequence decode)",
+        [](common_params & params, const std::string & value) {
+            params.moe_stream_stmoe_cct = value;
             params.moe_stream = true;
         }
     ));

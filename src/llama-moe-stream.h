@@ -33,9 +33,52 @@
 // note: multiple contexts decoding the same streamed model concurrently are not supported -
 // one context can evict slots referenced by the other's in-flight graph.
 
-enum class llama_moe_stream_policy { hotness, chain, infinity };
+enum class llama_moe_stream_policy { hotness, chain, infinity, fate_hotness, fate_arc };
+
+struct llama_moe_stream_arc {
+    std::deque<int32_t> t1, t2, b1, b2, pending;
+    uint32_t p = 0;
+    int32_t access(int32_t expert, const std::vector<int32_t> & slots,
+                   const std::vector<uint8_t> & states, const uint8_t * keep, bool demand = true);
+};
+
+std::vector<uint32_t> llama_moe_stream_fate_capacity(
+        const std::vector<uint64_t> & bytes, uint32_t experts, uint32_t minimum,
+        uint32_t shallow, uint64_t budget);
 
 struct llama_moe_stream;
+
+struct llama_moe_stmoe_entry {
+    int32_t expert;
+    uint8_t confidence;
+};
+
+struct llama_moe_stmoe_pair {
+    int32_t source, target;
+    uint32_t experts;
+    std::vector<std::vector<llama_moe_stmoe_entry>> rows;
+};
+
+struct llama_moe_stmoe_stats {
+    uint64_t predicted = 0, actual = 0, hit = 0, all_hit = 0, observations = 0;
+};
+
+struct llama_moe_stmoe {
+    uint32_t k = 0;
+    std::vector<int32_t> layers;
+    std::vector<llama_moe_stmoe_pair> pairs;
+    std::vector<std::vector<int32_t>> history, current, pending;
+    std::vector<llama_moe_stmoe_stats> stats;
+    size_t next = 0;
+    uint64_t step = 0;
+
+    static std::vector<int32_t> predict(const llama_moe_stmoe_pair & pair,
+            const std::vector<int32_t> & source, const std::vector<int32_t> & history);
+    static void update(llama_moe_stmoe_pair & pair,
+            const std::vector<int32_t> & source, const std::vector<int32_t> & actual);
+    void reset();
+    void observe(int32_t layer, const int32_t * ids, uint32_t count, std::ostream * trace);
+};
 
 enum llama_moe_stream_slot_state : uint8_t {
     LLAMA_MOE_STREAM_SLOT_EMPTY    = 0,
@@ -105,6 +148,7 @@ struct llama_moe_stream_layer {
     int64_t use_counter = 0;
     std::vector<float> markov;
     std::vector<float> score;
+    llama_moe_stream_arc arc;
     int64_t trace_step = 0;
     bool trace_initialized = false;
     llama_moe_stream_rank_stats rank_stats[2];
@@ -133,6 +177,7 @@ struct llama_moe_stream_layer {
     int32_t  plan_next_wave = -1; // wave expected to run next (ordering guard)
     std::vector<uint8_t> expert_wave; // [n_expert] wave each touched expert belongs to, 0xff = untouched
     std::vector<int32_t> plan_pool;   // resident slots the masked-out pairs of this wave park on
+    std::vector<int32_t> wave_accesses;
     std::vector<int32_t> pool_used;   // scratch: pool slots already used in the current token row
 
     std::vector<std::unique_ptr<llama_moe_stream_wave>> wave_ud; // stable per-wave op userdata
@@ -181,6 +226,11 @@ struct llama_moe_stream_token_stats {
 
 struct llama_moe_stream {
     uint32_t n_slots      = 0; // expert cache slots per streamed layer
+    std::vector<uint32_t> layer_slots;
+    std::vector<uint64_t> layer_bytes;
+    uint64_t cache_budget = 0;
+    uint32_t shallow_layers = 4;
+    uint32_t wave_capacity = 0; // optional common wave partition for policy comparisons
     int32_t  n_io_threads = 0;
 
     std::vector<std::unique_ptr<llama_moe_stream_layer>> layers; // [n_layer], null = not streamed
@@ -225,7 +275,12 @@ struct llama_moe_stream {
     size_t size_bufs() const;
 
     void print_stats() const;
-    void configure(const char * policy, const char * matrix, const char * trace_path, const char * eam = nullptr);
+    void configure(const char * policy, const char * matrix, const char * trace_path,
+                   const char * eam = nullptr, const char * stmoe_cct = nullptr);
+    std::string stmoe_path;
+    std::vector<int32_t> stmoe_layers;
+    llama_moe_stmoe stmoe;
+    void load_stmoe(const std::vector<std::string> & paths);
     void load_markov(const std::vector<std::string> & paths);
     void observe_locked(llama_moe_stream_layer & sl, const int32_t * ids, const float * weights,
                         uint32_t k, int64_t n_tokens, bool decode);

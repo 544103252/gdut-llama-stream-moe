@@ -8,9 +8,19 @@
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
 #include <stdexcept>
 
+extern "C" {
+#include "../examples/gguf-hash/deps/sha256/sha256.h"
+}
+
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <bcrypt.h>
 #include <malloc.h>
 #else
 #include <fcntl.h>
@@ -150,6 +160,359 @@ bool llama_moe_stream_layer::matches(const ggml_tensor * gate, const ggml_tensor
 }
 
 // sizes the per-layer table and clamps the I/O thread count; workers are spawned lazily on first use
+void llama_moe_stream::configure(const char * policy_arg, const char * matrix, const char * trace_path, const char * eam) {
+    const std::string name = policy_arg && *policy_arg ? policy_arg : "hotness";
+    if (name != "hotness" && name != "chain" && name != "moe-infinity") {
+        throw std::runtime_error("invalid MoE replacement policy");
+    }
+    policy = name == "chain" ? llama_moe_stream_policy::chain :
+             name == "moe-infinity" ? llama_moe_stream_policy::infinity : llama_moe_stream_policy::hotness;
+    if (policy != llama_moe_stream_policy::hotness || (trace_path && *trace_path)) {
+        if (gpu_decode_requested || gpu_decode_continuous_requested || shadow) {
+            LLAMA_LOG_INFO("%s: predictive policies and routing traces use CPU remap; GPU planning disabled\n", __func__);
+        }
+        gpu_decode_requested = false;
+        gpu_decode_continuous_requested = false;
+        shadow = false;
+    }
+    eam_path = eam ? eam : "";
+    if (policy == llama_moe_stream_policy::infinity && eam_path.empty()) {
+        throw std::runtime_error("moe-infinity requires --moe-stream-eam");
+    }
+    matrix_path = matrix ? matrix : "";
+    if (policy == llama_moe_stream_policy::chain && matrix_path.empty()) {
+        throw std::runtime_error("chain requires --moe-stream-markov");
+    }
+    if (trace_path && *trace_path) {
+        trace.open(trace_path, std::ios::out | std::ios::trunc);
+        if (!trace) {
+            throw std::runtime_error("cannot open MoE routing trace");
+        }
+        trace.precision(9);
+    }
+}
+
+static void moe_stream_hash(const std::string & path, uint8_t * actual) {
+    std::ifstream model(path, std::ios::binary);
+    if (!model) {
+        throw std::runtime_error("cannot hash GGUF");
+    }
+#ifdef _WIN32
+    struct hash_handles {
+        BCRYPT_ALG_HANDLE algorithm = nullptr;
+        BCRYPT_HASH_HANDLE hash = nullptr;
+        ~hash_handles() {
+            if (hash) { BCryptDestroyHash(hash); }
+            if (algorithm) { BCryptCloseAlgorithmProvider(algorithm, 0); }
+        }
+    } hash;
+    if (BCryptOpenAlgorithmProvider(&hash.algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) < 0 ||
+        BCryptCreateHash(hash.algorithm, &hash.hash, nullptr, 0, nullptr, 0, 0) < 0) {
+        throw std::runtime_error("cannot initialize GGUF SHA-256");
+    }
+#else
+    sha256_t hash;
+    sha256_init(&hash);
+#endif
+    std::vector<uint8_t> buffer(1024*1024);
+    while (model.read((char *) buffer.data(), buffer.size()) || model.gcount()) {
+#ifdef _WIN32
+        if (BCryptHashData(hash.hash, buffer.data(), (ULONG) model.gcount(), 0) < 0) {
+            throw std::runtime_error("GGUF SHA-256 update failed");
+        }
+#else
+        sha256_update(&hash, buffer.data(), (size_t) model.gcount());
+#endif
+    }
+    if (!model.eof()) {
+        throw std::runtime_error("GGUF hash read failed");
+    }
+#ifdef _WIN32
+    if (BCryptFinishHash(hash.hash, actual, 32, 0) < 0) {
+        throw std::runtime_error("GGUF SHA-256 finalization failed");
+    }
+#else
+    sha256_final(&hash, actual);
+#endif
+}
+
+const char * llama_moe_stream::policy_name() const {
+    switch (policy) {
+        case llama_moe_stream_policy::chain: return "chain";
+        case llama_moe_stream_policy::infinity: return "moe-infinity";
+        default: return "hotness";
+    }
+}
+
+void llama_moe_stream::load_eam(const std::vector<std::string> & paths) {
+    std::ifstream in(eam_path, std::ios::binary | std::ios::ate);
+    const auto length = in.tellg();
+    in.seekg(0);
+    auto u32 = [&]() {
+        uint8_t b[4];
+        if (!in.read((char *) b, 4)) {
+            throw std::runtime_error("truncated EAM collection");
+        }
+        return uint32_t(b[0]) | uint32_t(b[1]) << 8 | uint32_t(b[2]) << 16 | uint32_t(b[3]) << 24;
+    };
+    char magic[8];
+    if (!in.read(magic, 8) || memcmp(magic, "MOEEAM01", 8)) {
+        throw std::runtime_error("invalid EAM collection version");
+    }
+    const uint32_t nl = u32(), ne = u32(), count = u32();
+    if (nl != layers.size() || !ne || ne > 65536 || !count || count > 65536 || paths.size() != 1) {
+        throw std::runtime_error("invalid EAM dimensions/count or split GGUF unsupported");
+    }
+    const uint64_t cells = uint64_t(nl)*ne;
+    if (!cells || cells > SIZE_MAX/sizeof(uint32_t) ||
+        uint64_t(length) != 52 + cells*count*sizeof(uint32_t)) {
+        throw std::runtime_error("EAM collection size mismatch");
+    }
+    for (const auto & sl : layers) {
+        if (sl && sl->n_expert != ne) {
+            throw std::runtime_error("EAM expert count mismatch");
+        }
+    }
+    uint8_t expected[32], actual[32];
+    if (!in.read((char *) expected, 32)) {
+        throw std::runtime_error("missing EAM model digest");
+    }
+    moe_stream_hash(paths[0], actual);
+    if (memcmp(expected, actual, 32)) {
+        throw std::runtime_error("EAM collection GGUF SHA-256 mismatch");
+    }
+    std::vector<std::vector<uint32_t>> history;
+    std::vector<double> norms;
+    for (uint32_t r = 0; r < count; r++) {
+        std::vector<uint32_t> matrix(cells);
+        double norm = 0;
+        for (auto & value : matrix) {
+            value = u32();
+            norm += double(value)*value;
+        }
+        if (norm == 0) {
+            throw std::runtime_error("empty historical EAM");
+        }
+        history.push_back(std::move(matrix));
+        norms.push_back(std::sqrt(norm));
+    }
+    eam_experts = ne;
+    eam_history.swap(history);
+    eam_norms.swap(norms);
+    begin_iteration();
+}
+
+void llama_moe_stream::begin_iteration() {
+    iteration_eam.assign(layers.size()*eam_experts, 0);
+    eam_match = -1;
+    eam_fallback = "non_decode";
+}
+
+void llama_moe_stream::predict_eam(llama_moe_stream_layer & sl, const int32_t * ids, uint32_t k) {
+    eam_match = -1;
+    eam_fallback = "no_match";
+    GGML_ASSERT(eam_experts == sl.n_expert && sl.il >= 0 && (size_t) sl.il < layers.size());
+    for (uint32_t r = 0; r < k; r++) {
+        GGML_ASSERT(ids[r] >= 0 && (uint32_t) ids[r] < eam_experts);
+        sat_inc(iteration_eam[size_t(sl.il)*eam_experts + ids[r]]);
+    }
+    double best = 0;
+    for (size_t r = 0; r < eam_history.size(); r++) {
+        double dot = 0;
+        for (size_t i = 0; i < iteration_eam.size(); i++) {
+            dot += double(iteration_eam[i])*eam_history[r][i];
+        }
+        // The query norm is shared by all candidates.
+        const double similarity = dot/eam_norms[r];
+        if (similarity > best) {
+            best = similarity;
+            eam_match = (int32_t) r;
+        }
+    }
+    if (eam_match >= 0) {
+        const auto & row = eam_history[eam_match];
+        const size_t offset = size_t(sl.il)*eam_experts;
+        double sum = 0;
+        for (uint32_t e = 0; e < eam_experts; e++) { sum += row[offset + e]; }
+        eam_fallback = sum ? "none" : "zero_row";
+        if (sum) {
+            sl.score.resize(eam_experts);
+            for (uint32_t e = 0; e < eam_experts; e++) {
+                sl.score[e] = float(row[offset + e]/sum);
+            }
+        }
+    }
+    if (trace.is_open()) {
+        trace << "{\"event\":\"eam\",\"layer\":" << sl.il << ",\"call\":" << stats.n_calls
+              << ",\"match\":" << eam_match << ",\"fallback\":\"" << eam_fallback << "\"}\n";
+    }
+}
+
+void llama_moe_stream::load_markov(const std::vector<std::string> & paths) {
+    std::ifstream in(matrix_path, std::ios::binary);
+    auto read_u32 = [&]() {
+        uint8_t b[4];
+        if (!in.read((char *) b, 4)) {
+            throw std::runtime_error("truncated Markov matrix");
+        }
+        return uint32_t(b[0]) | (uint32_t(b[1]) << 8) | (uint32_t(b[2]) << 16) | (uint32_t(b[3]) << 24);
+    };
+    char magic[8];
+    if (!in.read(magic, 8) || memcmp(magic, "MOEMKV01", 8) != 0) {
+        throw std::runtime_error("invalid Markov matrix version");
+    }
+    const uint32_t nl = read_u32(), ne = read_u32();
+    if (nl != layers.size() || ne == 0 || ne > 65536 || paths.size() != 1) {
+        throw std::runtime_error("Markov dimensions mismatch or split GGUF unsupported");
+    }
+    uint8_t expected[32], actual[32];
+    if (!in.read((char *) expected, 32)) {
+        throw std::runtime_error("missing Markov model digest");
+    }
+    moe_stream_hash(paths[0], actual);
+    if (memcmp(expected, actual, 32) != 0) {
+        throw std::runtime_error("Markov matrix GGUF SHA-256 mismatch");
+    }
+    for (uint32_t l = 0; l < nl; l++) {
+        auto * sl = layers[l].get();
+        if (sl && sl->n_expert != ne) {
+            throw std::runtime_error("Markov expert count mismatch");
+        }
+        if (sl) {
+            sl->markov.resize(size_t(ne)*ne);
+        }
+        for (uint32_t i = 0; i < ne; i++) {
+            double sum = 0;
+            for (uint32_t j = 0; j < ne; j++) {
+                uint32_t bits = read_u32();
+                float p;
+                memcpy(&p, &bits, 4);
+                if (!std::isfinite(p) || p < 0 || p > 1) {
+                    throw std::runtime_error("invalid Markov probability");
+                }
+                sum += p;
+                if (sl) {
+                    sl->markov[size_t(i)*ne + j] = p;
+                }
+            }
+            if (std::abs(sum - 1.0) > 1e-4) {
+                throw std::runtime_error("Markov row is not normalized");
+            }
+        }
+    }
+    if (in.peek() != std::char_traits<char>::eof()) {
+        throw std::runtime_error("unexpected Markov trailing data");
+    }
+}
+
+void llama_moe_stream::observe_locked(llama_moe_stream_layer & sl, const int32_t * ids,
+                                     const float * weights, uint32_t k, int64_t n_tokens, bool decode) {
+    sl.score.clear();
+    const int64_t start = ggml_time_us();
+    if (policy == llama_moe_stream_policy::chain && decode && n_tokens == 1) {
+        GGML_ASSERT(weights != nullptr && !sl.markov.empty());
+        sl.score.assign(sl.n_expert, 0.0f);
+        for (uint32_t i = 0; i < k; i++) {
+            GGML_ASSERT(ids[i] >= 0 && (uint32_t) ids[i] < sl.n_expert);
+            GGML_ASSERT(std::isfinite(weights[i]) && weights[i] >= 0);
+            for (uint32_t e = 0; e < sl.n_expert; e++) {
+                sl.score[e] += weights[i]*sl.markov[size_t(ids[i])*sl.n_expert + e];
+            }
+        }
+    }
+    if (policy == llama_moe_stream_policy::infinity && decode && n_tokens == 1) {
+        predict_eam(sl, ids, k);
+    }
+    rule_us += ggml_time_us() - start;
+    auto & p = phases[decode ? 1 : 0];
+    auto & ranks = sl.rank_stats[decode ? 1 : 0];
+    sl.rank_slots.clear();
+    sl.expert_rank.assign(sl.n_expert, -1);
+    for (uint32_t s = 0; s < sl.n_slots; s++) {
+        if (sl.slot_state[s] == LLAMA_MOE_STREAM_SLOT_RESIDENT) {
+            sl.rank_slots.push_back(s);
+        }
+    }
+    std::sort(sl.rank_slots.begin(), sl.rank_slots.end(), [&](int32_t a, int32_t b) {
+        const int32_t ea = sl.slot_expert[a], eb = sl.slot_expert[b];
+        if (sl.route_hotness[ea] != sl.route_hotness[eb]) {
+            return sl.route_hotness[ea] > sl.route_hotness[eb];
+        }
+        if (sl.slot_last_use[a] != sl.slot_last_use[b]) {
+            return sl.slot_last_use[a] > sl.slot_last_use[b];
+        }
+        return ea < eb;
+    });
+    for (size_t r = 0; r < sl.rank_slots.size(); r++) {
+        sl.expert_rank[sl.slot_expert[sl.rank_slots[r]]] = (int32_t) r;
+    }
+    std::vector<uint8_t> cold_seen = sl.seen;
+    if (trace.is_open() && decode && !sl.trace_initialized) {
+        trace << "{\"event\":\"initial\",\"layer\":" << sl.il
+              << ",\"use_counter\":" << sl.use_counter << ",\"decay\":" << hot_decay_interval;
+        auto array = [&](const char * name, const auto & values) {
+            trace << ",\"" << name << "\":[";
+            for (size_t i = 0; i < values.size(); i++) {
+                trace << (i ? "," : "") << int64_t(values[i]);
+            }
+            trace << "]";
+        };
+        array("slots", sl.slot_expert);
+        array("states", sl.slot_state);
+        array("hotness", sl.route_hotness);
+        array("last_use", sl.slot_last_use);
+        array("seen", sl.seen);
+        trace << "}\n";
+        sl.trace_initialized = true;
+    }
+    for (int64_t t = 0; t < n_tokens; t++) {
+        bool all = true;
+        if (trace.is_open()) {
+            trace << "{\"layer\":" << sl.il << ",\"step\":" << sl.trace_step++ << ",\"call\":" << stats.n_calls
+                  << ",\"phase\":\"" << (decode ? "decode" : "prefill") << "\",\"ids\":[";
+        }
+        for (uint32_t r = 0; r < k; r++) {
+            const int32_t e = ids[t*k + r];
+            GGML_ASSERT(e >= 0 && (uint32_t) e < sl.n_expert);
+            auto it = sl.expert_slot.find(e);
+            const bool hit = it != sl.expert_slot.end() && sl.slot_state[it->second] == LLAMA_MOE_STREAM_SLOT_RESIDENT;
+            p.hit += hit;
+            p.miss += !hit;
+            if (hit) {
+                const int32_t rank = sl.expert_rank[e];
+                GGML_ASSERT(rank >= 0);
+                if ((size_t) rank < ranks.hits.size()) {
+                    ranks.hits[rank]++;
+                } else {
+                    ranks.overflow++;
+                }
+            } else {
+                ranks.miss++;
+                ranks.loading += it != sl.expert_slot.end() && sl.slot_state[it->second] == LLAMA_MOE_STREAM_SLOT_LOADING;
+            }
+            p.loading += it != sl.expert_slot.end() && sl.slot_state[it->second] == LLAMA_MOE_STREAM_SLOT_LOADING;
+            p.cold += !cold_seen[e];
+            cold_seen[e] = 1;
+            all = all && hit;
+            if (trace.is_open()) {
+                trace << (r ? "," : "") << e;
+            }
+        }
+        p.tokens++;
+        p.all_hit += all;
+        if (trace.is_open()) {
+            trace << "],\"weights\":[";
+            for (uint32_t r = 0; r < k; r++) {
+                trace << (r ? "," : "") << (weights ? weights[t*k + r] : 0.0f);
+            }
+            trace << "]}\n";
+            if (!trace) {
+                GGML_ABORT("MoE routing trace write failed");
+            }
+        }
+    }
+}
+
 llama_moe_stream::llama_moe_stream(
         uint32_t n_layer,
         uint32_t n_slots,
@@ -239,6 +602,7 @@ ggml_tensor * llama_moe_stream::create_cache_tensor(
         sl->slot_gen     .resize(n_slots, 0);
         sl->slot_last_use.resize(n_slots, 0);
         sl->expert_map   .resize(n_expert, -1);
+        sl->seen.resize(n_expert, 0);
         sl->route_hotness.resize(n_expert, 0);
         sl->keep         .resize(n_slots, 0);
     }
@@ -569,6 +933,8 @@ bool llama_moe_stream::sync_decode_policy_locked() {
 }
 
 void llama_moe_stream::open_files(const std::vector<std::string> & paths) {
+    if (policy == llama_moe_stream_policy::chain) { load_markov(paths); }
+    if (policy == llama_moe_stream_policy::infinity) { load_eam(paths); }
     for (const auto & path : paths) {
         if (path.empty()) {
             throw std::runtime_error("MoE expert streaming requires a file-based model (not a stream/file descriptor)");
@@ -779,6 +1145,7 @@ void llama_moe_stream::worker_loop(int32_t worker_idx) {
         lk.unlock();
 
         bool ok = true;
+        int64_t transferred = 0;
         int64_t n_slices = 0;
         int64_t read_lock_wait_us = 0;
         int64_t read_us = 0;
@@ -805,6 +1172,7 @@ void llama_moe_stream::worker_loop(int32_t worker_idx) {
             }
             const int64_t upload_start_us = measure_load ? ggml_time_us() : 0;
             ggml_backend_tensor_set(wt.cache, data, (size_t) w.slot*wt.nb_expert, wt.nb_expert);
+            transferred += wt.nb_expert;
             if (measure_load) {
                 upload_us += ggml_time_us() - upload_start_us;
             }
@@ -812,6 +1180,7 @@ void llama_moe_stream::worker_loop(int32_t worker_idx) {
 
         lk.lock();
 
+        bytes_read += transferred;
         if (measure_load && token_stats_active) {
             token_stats.n_worker_slices += n_slices;
             token_stats.t_worker_read_lock_wait_us += read_lock_wait_us;
@@ -828,6 +1197,7 @@ void llama_moe_stream::worker_loop(int32_t worker_idx) {
         }
         if (ok && !load_failed && sl.slot_parts_pending[w.slot] == 0) {
             sl.slot_state[w.slot] = LLAMA_MOE_STREAM_SLOT_RESIDENT;
+            loads++;
         }
         if (load_failed || sl.slot_parts_pending[w.slot] == 0) {
             cv_done.notify_all();
@@ -854,6 +1224,14 @@ int32_t llama_moe_stream::pick_victim_locked(llama_moe_stream_layer & sl, const 
             v = s;
             continue;
         }
+        if (policy != llama_moe_stream_policy::hotness && !sl.score.empty()) {
+            const int32_t es = sl.slot_expert[s];
+            const int32_t ev = sl.slot_expert[v];
+            if (sl.score[es] < sl.score[ev] || (sl.score[es] == sl.score[ev] && es < ev)) {
+                v = s;
+            }
+            continue;
+        }
         const uint32_t hs = sl.route_hotness[sl.slot_expert[s]];
         const uint32_t hv = sl.route_hotness[sl.slot_expert[v]];
         if (hs < hv || (hs == hv && sl.slot_last_use[s] < sl.slot_last_use[v])) {
@@ -868,6 +1246,12 @@ int32_t llama_moe_stream::pick_victim_locked(llama_moe_stream_layer & sl, const 
 // in-flight load for the old occupant is recognized as stale), and update the expert_slot index
 void llama_moe_stream::reserve_slot_locked(
         llama_moe_stream_layer & sl, int32_t expert, int32_t slot, bool update_policy) {
+    if (trace.is_open() && decode_phase) {
+        trace << "{\"event\":\"replace\",\"layer\":" << sl.il << ",\"call\":" << stats.n_calls
+              << ",\"slot\":" << slot << ",\"old\":" << sl.slot_expert[slot]
+              << ",\"expert\":" << expert << "}\n";
+    }
+    sl.seen[expert] = 1;
     if (sl.slot_expert[slot] >= 0) {
         sl.expert_slot.erase(sl.slot_expert[slot]);
     }
@@ -907,6 +1291,13 @@ bool llama_moe_stream::build_plan_locked(
     std::fill(sl.keep.begin(), sl.keep.end(), 0);
 
     refresh_expert_map_locked(sl);
+    if (!gpu_decode && !shadow) {
+        // Protect the complete active set before choosing any CPU-policy victims.
+        for (const int32_t expert : sl.uniq) {
+            const auto it = sl.expert_slot.find(expert);
+            if (it != sl.expert_slot.end()) { sl.keep[it->second] = 1; }
+        }
+    }
 
     bool has_missing = false;
     for (const int32_t expert : sl.uniq) {
@@ -1098,6 +1489,50 @@ void llama_moe_stream::count_token_stats_locked(
         } else {
             token_stats.n_miss++;
         }
+    }
+}
+
+void llama_moe_stream::print_stats() const {
+    std::lock_guard<std::mutex> lock(mtx);
+
+    if (gpu_decode) {
+        LLAMA_LOG_INFO("%s: CPU routing/rank counters unavailable during GPU decode\n", __func__);
+        return;
+    }
+    const int64_t n_touched = stats.n_hit + stats.n_miss;
+    for (int p = 0; p < 2; p++) {
+        const auto & s = phases[p];
+        fprintf(stderr, "moe_cache phase=%s policy=%s hit=%" PRId64 " miss=%" PRId64
+                       " loading=%" PRId64 " cold=%" PRId64 " all_hit=%" PRId64 " tokens=%" PRId64 "\n",
+                       p ? "decode" : "prefill", policy_name(),
+                       s.hit, s.miss, s.loading, s.cold, s.all_hit, s.tokens);
+    }
+    fprintf(stderr, "moe_cache loads=%" PRId64 " bytes=%" PRId64 " rule_us=%" PRId64 " stall_us=%" PRId64 "\n",
+            loads, bytes_read, rule_us, stats.t_stall_us + stats.t_stall_wave_us);
+    for (const auto & sl : layers) {
+        if (!sl) {
+            continue;
+        }
+        for (int p = 0; p < 2; p++) {
+            const auto & ranks = sl->rank_stats[p];
+            fprintf(stderr, "moe_rank layer=%d phase=%s policy=%s slots=%u miss=%" PRIu64
+                    " loading=%" PRIu64 " overflow=%" PRIu64 " counts=",
+                    sl->il, p ? "decode" : "prefill", policy_name(), sl->n_slots,
+                    ranks.miss, ranks.loading, ranks.overflow);
+            for (size_t r = 0; r < ranks.hits.size(); r++) {
+                fprintf(stderr, "%s%" PRIu64, r ? "," : "", ranks.hits[r]);
+            }
+            fprintf(stderr, "\n");
+        }
+    }
+    LLAMA_LOG_INFO("%s: moe stream: remap calls = %" PRId64 ", expert hits = %" PRId64 ", misses = %" PRId64 " (%" PRId64 " cold), hit rate = %.2f%%\n",
+            __func__, stats.n_calls, stats.n_hit, stats.n_miss, stats.n_miss_cold,
+            n_touched > 0 ? 100.0*stats.n_hit/n_touched : 0.0);
+    LLAMA_LOG_INFO("%s: moe stream: load stall = %.2f ms total (%.3f ms per remap call)\n",
+            __func__, stats.t_stall_us/1000.0, stats.n_calls > 0 ? stats.t_stall_us/1000.0/stats.n_calls : 0.0);
+    if (stats.n_wave_calls > 0) {
+        LLAMA_LOG_INFO("%s: moe stream: waves = %" PRId64 " (%" PRId64 " non-empty), preloads issued = %" PRId64 " (ready on arrival = %" PRId64 "), wave stall = %.2f ms\n",
+                __func__, stats.n_wave_calls, stats.n_waves_run, stats.n_preload_issued, stats.n_preload_ready, stats.t_stall_wave_us/1000.0);
     }
 }
 
@@ -1353,7 +1788,7 @@ bool llama_moe_stream::eval_callback(
 // then rewrite each id to its cache slot. this only relabels ids, so the same experts are computed
 // in the same order; the result matches a non-streamed run (bit-exact when both paths use the same
 // kernels, as on CUDA; a CPU build that repacks the non-streamed weights can differ in the last bits).
-void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
+static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * weights, int ith, int nth, void * userdata) {
     GGML_UNUSED(nth);
     if (ith != 0) {
         return;
@@ -1382,9 +1817,12 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
     }
 
     mgr->n_calls++;
+    mgr->stats.n_calls++;
     mgr->start_workers_locked();
 
     mgr->count_token_stats_locked(*sl, ids, (uint32_t) a->ne[0], a->ne[1]);
+    mgr->observe_locked(*sl, ids, weights ? (const float *) weights->data : nullptr,
+                        (uint32_t) a->ne[0], a->ne[1], mgr->decode_phase);
 
     // distinct experts touched by this ubatch, in first-use order
     sl->touched.assign(sl->n_expert, 0);
@@ -1425,8 +1863,13 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
         }
     }
 
+    mgr->stats.n_hit += sl->uniq.size() - sl->plan.loads.size();
+    mgr->stats.n_miss += sl->plan.loads.size();
+    for (const auto & load : sl->plan.loads) { mgr->stats.n_miss_cold += !sl->seen[load.expert]; }
     const bool shadow_pending = llama_moe_stream_shadow_prepare(*sl, a);
+    const int64_t stall_start = ggml_time_us();
     mgr->apply_plan_locked(lk, *sl);
+    mgr->stats.t_stall_us += ggml_time_us() - stall_start;
     mgr->commit_plan_locked(*sl, ids, out, n);
     if (shadow_pending && !sl->shadow_ops->commit(sl->shadow_backend, sl->il)) {
         LLAMA_LOG_ERROR("%s: layer %d: GPU commit failed\n", __func__, sl->il);
@@ -1435,6 +1878,17 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
 }
 
 // stable per-wave userdata; grows lazily and records the per-wave expert capacity (set at build)
+void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
+    moe_stream_remap_impl(dst, a, nullptr, ith, nth, userdata);
+}
+
+void llama_moe_stream_remap_weighted(ggml_tensor * dst, const ggml_tensor * a,
+                                    const ggml_tensor * weights, int ith, int nth, void * userdata) {
+    GGML_ASSERT(weights->type == GGML_TYPE_F32 && ggml_is_contiguous(weights));
+    GGML_ASSERT(ggml_nelements(weights) == ggml_nelements(a));
+    moe_stream_remap_impl(dst, a, weights, ith, nth, userdata);
+}
+
 llama_moe_stream_wave * llama_moe_stream_layer::wave_userdata(int32_t wave, uint32_t capacity) {
     GGML_ASSERT(capacity >= 1 && capacity <= n_slots);
     plan_capacity = capacity;
@@ -1455,6 +1909,7 @@ void llama_moe_stream::plan_waves_locked(llama_moe_stream_layer & sl, const int3
     }
     gpu_decode_state_ready = false;
     n_calls++;
+    stats.n_calls++;
     start_workers_locked();
 
     sl.touched.assign(sl.n_expert, 0);
@@ -1511,8 +1966,8 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
 
     // reserve and demand-load this wave's experts (per-expert, same path as the decode remap)
     bool waited = false;
-    size_t n_tasks = 0;
     if (count > 0) {
+        stats.n_waves_run++;
         for (size_t i = first; i < first + count; i++) {
             const int32_t e  = sl.uniq[i];
             const auto    it = sl.expert_slot.find(e);
@@ -1520,9 +1975,12 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
                 // already in the cache (resident, or still loading from the previous wave's preload)
                 const int32_t s = it->second;
                 if (sl.slot_state[s] == LLAMA_MOE_STREAM_SLOT_LOADING) {
-                    n_tasks += queue_load_locked(sl, e, s);
+                    notify_workers_locked(queue_load_locked(sl, e, s));
                     waited = true;
+                } else {
+                    stats.n_preload_ready++; // resident from the previous wave's preload
                 }
+                stats.n_hit++;
                 sl.keep[s] = 1;
                 sl.demand_slots.push_back(s);
             } else {
@@ -1534,8 +1992,12 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
                         GGML_ABORT("MoE expert streaming: expert load failed (I/O error)");
                     }
                 }
+                if (!sl.seen[e]) {
+                    stats.n_miss_cold++;
+                }
                 reserve_slot_locked(sl, e, v);
-                n_tasks += queue_load_locked(sl, e, v);
+                notify_workers_locked(queue_load_locked(sl, e, v));
+                stats.n_miss++;
                 waited = true;
                 sl.keep[v] = 1;
                 sl.demand_slots.push_back(v);
@@ -1555,15 +2017,18 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
             if (v < 0) {
                 continue;
             }
+            if (!sl.seen[e]) {
+                stats.n_miss_cold++;
+            }
             reserve_slot_locked(sl, e, v);
             sl.keep[v] = 1;
-            n_tasks += queue_load_locked(sl, e, v);
+            notify_workers_locked(queue_load_locked(sl, e, v));
+            stats.n_preload_issued++;
         }
     }
 
-    notify_workers_locked(n_tasks);
-
     if (waited) {
+        const int64_t t0 = ggml_time_us();
         cv_done.wait(lk, [&]{
             if (load_failed) {
                 return true;
@@ -1578,6 +2043,7 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
         if (load_failed) {
             GGML_ABORT("MoE expert streaming: expert load failed (I/O error)");
         }
+        stats.t_stall_wave_us += ggml_time_us() - t0;
     }
 
     // parking pool: this wave's own resident slots plus the borrowed ones (all keep-protected;
@@ -1662,7 +2128,10 @@ void llama_moe_stream_wave_ids(ggml_tensor * dst, int ith, int nth, void * userd
     }
 
 
+    mgr->stats.n_wave_calls++;
     if (w == 0) {
+        const float * trace_weights = mgr->trace.is_open() ? (const float *) dst->src[1]->data : nullptr;
+        mgr->observe_locked(*sl, ids, trace_weights, (uint32_t) a->ne[0], a->ne[1], false);
         mgr->count_token_stats_locked(*sl, ids, (uint32_t) a->ne[0], a->ne[1]);
         mgr->plan_waves_locked(*sl, ids, n);
     }

@@ -324,6 +324,10 @@ extern "C" {
         uint64_t moe_stream_budget;     // total cache byte budget, used when slots == 0 (0 = auto heuristic)
         int32_t  moe_stream_io_threads; // expert load I/O threads (<= 0 = default)
         bool     moe_stream_direct;     // use O_DIRECT for expert reads (bypass page cache); falls back if unsupported
+        const char * moe_stream_policy; // "hotness" (default), "chain", or "moe-infinity"
+        const char * moe_stream_eam; // versioned historical EAM collection
+        const char * moe_stream_markov; // versioned Markov matrix file
+        const char * moe_stream_trace;  // optional routing trace JSONL file
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
@@ -1562,6 +1566,8 @@ extern "C" {
     LLAMA_API struct llama_perf_sampler_data llama_perf_sampler      (const struct llama_sampler * chain);
     LLAMA_API void                           llama_perf_sampler_print(const struct llama_sampler * chain);
     LLAMA_API void                           llama_perf_sampler_reset(      struct llama_sampler * chain);
+
+    LLAMA_API void llama_moe_stream_print_stats(const struct llama_model * model);
 
     // reset and print per-conversation MoE expert cache statistics
     LLAMA_API void llama_moe_stream_stats_reset(      struct llama_context * ctx);

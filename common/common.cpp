@@ -1557,6 +1557,10 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.moe_stream_budget     = params.moe_stream_budget;
     mparams.moe_stream_io_threads = params.moe_stream_io_threads;
     mparams.moe_stream_direct     = params.moe_stream_direct;
+    mparams.moe_stream_policy     = params.moe_stream_policy.c_str();
+    mparams.moe_stream_eam        = params.moe_stream_eam.c_str();
+    mparams.moe_stream_markov     = params.moe_stream_markov.c_str();
+    mparams.moe_stream_trace      = params.moe_stream_trace.c_str();
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;

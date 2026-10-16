@@ -117,6 +117,13 @@ function(llama_build_and_test source)
 endfunction()
 
 # build test-tokenizer-0 target once and add many tests
+llama_build_and_test(test-moe-markov.cpp ../src/llama-moe-stream.cpp ../src/llama-mmap.cpp ../src/llama-impl.cpp ../examples/gguf-hash/deps/sha256/sha256.c)
+target_include_directories(test-moe-markov PRIVATE ../src ../examples/gguf-hash/deps)
+target_link_libraries(test-moe-markov PRIVATE llama ggml)
+if (WIN32)
+    target_link_libraries(test-moe-markov PRIVATE bcrypt)
+endif()
+
 llama_build(test-tokenizer-0.cpp)
 
 llama_test(test-tokenizer-0 NAME test-tokenizer-0-bert-bge          ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-bert-bge.gguf)

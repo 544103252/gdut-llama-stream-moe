@@ -1449,6 +1449,15 @@ llm_graph_result * llama_context::process_ubatch(
         mstream->token_stats_begin();
     }
 
+    if (auto * stream = model.moe_stream()) {
+        stream->decode_phase = !moe_stats_prefill && ubatch.n_tokens == 1;
+        if (stream->policy == llama_moe_stream_policy::infinity) {
+            if (ubatch.n_seqs_unq != 1) {
+                GGML_ABORT("moe-infinity requires a single sequence");
+            }
+            stream->begin_iteration();
+        }
+    }
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
 
     if (status == GGML_STATUS_SUCCESS && mstream && moe_stream_continuous) {

@@ -1998,6 +1998,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             ids_gemm = ggml_moe_stream_cache_decide(
                     ctx0, ids_cont, il, msl->n_expert, msl->n_slots);
             cb(ids_gemm, "ffn_moe_stream_cache_decide", il);
+        } else if (msl->mgr->policy == llama_moe_stream_policy::chain || msl->mgr->trace.is_open()) {
+            ids_gemm = ggml_map_custom2(ctx0, ids_cont, ggml_cont(ctx0, weights), llama_moe_stream_remap_weighted, 1, msl);
+            cb(ids_gemm, "ffn_moe_topk_stream", il);
         } else {
             ids_gemm = ggml_map_custom1(ctx0, ids_cont, llama_moe_stream_remap, 1, msl);
             cb(ids_gemm, "ffn_moe_topk_stream", il);
@@ -2161,15 +2164,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     if (msl && n_stream_waves > 1) {
         ggml_tensor * ids_cont = ggml_cont(ctx0, selected_experts);
+        ggml_tensor * trace_weights = msl->mgr->trace.is_open() ? ggml_cont(ctx0, weights) : nullptr;
 
         for (uint32_t w = 0; w < n_stream_waves; w++) {
-            ggml_tensor * args[2] = { ids_cont, nullptr };
-            int n_args = 1;
+            ggml_tensor * args[3] = { ids_cont, trace_weights, nullptr };
+            int n_args = trace_weights ? 2 : 1;
             if (experts != nullptr) {
                 // ordering token: forces this wave's ids op to run after the previous wave's GEMMs
                 //   consumed their slots; a 1-element view keeps the cross-backend copy tiny
-                args[1] = ggml_view_1d(ctx0, experts, 1, 0);
-                n_args  = 2;
+                args[n_args++] = ggml_view_1d(ctx0, experts, 1, 0);
             }
             ggml_tensor * ids_w = ggml_custom_4d(ctx0, GGML_TYPE_I32,
                     ids_cont->ne[0], ids_cont->ne[1], 1, 1,

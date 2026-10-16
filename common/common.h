@@ -588,6 +588,10 @@ struct common_params {
     uint64_t moe_stream_budget     = 0;     // total expert cache byte budget, used when slots == 0 (0 = auto)
     int32_t  moe_stream_io_threads = 0;     // expert load I/O threads (<= 0 = default)
     bool     moe_stream_direct     = false; // use O_DIRECT for expert reads (bypass page cache)
+    std::string moe_stream_policy = "hotness";
+    std::string moe_stream_eam;
+    std::string moe_stream_markov;
+    std::string moe_stream_trace;
 
     bool single_turn       = false; // single turn chat conversation
 

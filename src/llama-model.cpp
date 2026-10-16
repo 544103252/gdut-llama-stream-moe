@@ -1415,6 +1415,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     params.moe_stream_io_threads,
                     params.moe_stream_direct,
                     full_cache_test);
+            pimpl->moe_stream->configure(params.moe_stream_policy, params.moe_stream_markov, params.moe_stream_trace, params.moe_stream_eam);
             LLAMA_LOG_INFO("%s: MoE expert SSD streaming enabled, %u of %u experts cached per layer, %d I/O threads\n",
                     __func__, n_slots, hparams.n_expert, pimpl->moe_stream->n_io_threads);
         }
@@ -2141,6 +2142,12 @@ llama_moe_stream * llama_model::moe_stream() const {
     return pimpl->moe_stream.get();
 }
 
+void llama_moe_stream_print_stats(const llama_model * model) {
+    if (model && model->moe_stream()) {
+        model->moe_stream()->print_stats();
+    }
+}
+
 const ggml_tensor * llama_model::get_tensor(const char * name) const {
     auto it = std::find_if(tensors_by_name.begin(), tensors_by_name.end(),
             [name](const std::pair<std::string, ggml_tensor *> & it) {
@@ -2464,6 +2471,10 @@ llama_model_params llama_model_default_params() {
         /*.moe_stream_budget           =*/ 0,
         /*.moe_stream_io_threads       =*/ 0,
         /*.moe_stream_direct           =*/ false,
+        /*.moe_stream_policy           =*/ nullptr,
+        /*.moe_stream_eam              =*/ nullptr,
+        /*.moe_stream_markov           =*/ nullptr,
+        /*.moe_stream_trace            =*/ nullptr,
         /*.vocab_only                  =*/ false,
         /*.use_mmap                    =*/ true,
         /*.use_direct_io               =*/ false,

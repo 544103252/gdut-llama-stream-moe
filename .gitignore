@@ -152,4 +152,5 @@ a.out.*
 # AGENTS
 
 AGENTS.local.md
+/experiments/moe-markov/
 .pi/SYSTEM.md

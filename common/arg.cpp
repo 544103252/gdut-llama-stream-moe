@@ -2492,6 +2492,41 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_STREAM"));
     add_opt(common_arg(
+        {"--moe-stream-policy"}, "hotness|chain|moe-infinity",
+        "expert cache replacement policy (default: hotness)",
+        [](common_params & params, const std::string & value) {
+            if (value != "hotness" && value != "chain" && value != "moe-infinity") {
+                throw std::invalid_argument("expected hotness, chain or moe-infinity");
+            }
+            params.moe_stream_policy = value;
+            params.moe_stream = true;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-eam"}, "PATH",
+        "offline historical EAM collection for moe-infinity replacement",
+        [](common_params & params, const std::string & value) {
+            params.moe_stream_eam = value;
+            params.moe_stream = true;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-markov"}, "PATH",
+        "offline Markov matrix for chain replacement",
+        [](common_params & params, const std::string & value) {
+            params.moe_stream_markov = value;
+            params.moe_stream = true;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-trace"}, "PATH",
+        "write expert routing and residency observations as JSONL",
+        [](common_params & params, const std::string & value) {
+            params.moe_stream_trace = value;
+            params.moe_stream = true;
+        }
+    ));
+    add_opt(common_arg(
         {"--moe-stream-cache"}, "<NG|Ns>",
         "expert cache for --moe-stream: memory budget in GiB (e.g. 40) or exact slots per layer with an 's' suffix (e.g. 64s); implies --moe-stream (default: auto)",
         [](common_params & params, const std::string & value) {

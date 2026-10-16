@@ -5,8 +5,10 @@
 #include "ggml-cpp.h"
 
 #include <condition_variable>
+#include <array>
 #include <cstdint>
 #include <deque>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -24,11 +26,14 @@
 // selected, so streaming affects latency, not outputs.
 //
 // Missing experts are loaded by a pool of I/O threads while the remap op waits; eviction is by
-// decaying route hotness with an LRU tiebreak. Reads are buffered by default, or O_DIRECT with
-// --moe-stream-direct or LLAMA_ARG_MOE_STREAM_DIRECT (bypasses the page cache).
+// decaying route hotness with an LRU tiebreak, or offline Markov/EAM scores during decode.
+// Reads are buffered by default, or O_DIRECT with
+// --moe-stream-direct or LLAMA_ARG_MOE_STREAM_DIRECT (bypasses the page cache; recommended when the model far exceeds RAM).
 //
 // note: multiple contexts decoding the same streamed model concurrently are not supported -
 // one context can evict slots referenced by the other's in-flight graph.
+
+enum class llama_moe_stream_policy { hotness, chain, infinity };
 
 struct llama_moe_stream;
 
@@ -62,6 +67,13 @@ struct llama_moe_stream_plan {
     std::vector<int32_t> required_slots;
 };
 
+struct llama_moe_stream_rank_stats {
+    std::array<uint64_t, 180> hits{};
+    uint64_t miss = 0;
+    uint64_t loading = 0;
+    uint64_t overflow = 0;
+};
+
 // userdata of one wave's custom ops (multi-pass prefill): identifies which pass this is
 struct llama_moe_stream_wave {
     llama_moe_stream_layer * sl   = nullptr;
@@ -88,8 +100,16 @@ struct llama_moe_stream_layer {
     std::unordered_map<int32_t, int32_t> expert_slot;   // RESIDENT and LOADING entries
     std::vector<int32_t>                 expert_map;    // [n_expert] committed RESIDENT mapping
 
+    std::vector<uint8_t> seen; // [n_expert] cold-miss attribution
     std::vector<uint32_t> route_hotness; // [n_expert] decayed selection counts, for eviction
     int64_t use_counter = 0;
+    std::vector<float> markov;
+    std::vector<float> score;
+    int64_t trace_step = 0;
+    bool trace_initialized = false;
+    llama_moe_stream_rank_stats rank_stats[2];
+    std::vector<int32_t> rank_slots;
+    std::vector<int32_t> expert_rank;
 
     ggml_backend_t shadow_backend = nullptr;
     const ggml_backend_moe_stream_cache_ops * shadow_ops = nullptr;
@@ -170,7 +190,7 @@ struct llama_moe_stream {
             uint32_t n_slots,
             int32_t n_io_threads,
             bool direct,
-            bool full_cache_test);
+            bool full_cache_test = false);
     ~llama_moe_stream();
 
     llama_moe_stream_layer * layer(int32_t il) const {
@@ -204,6 +224,32 @@ struct llama_moe_stream {
 
     size_t size_bufs() const;
 
+    void print_stats() const;
+    void configure(const char * policy, const char * matrix, const char * trace_path, const char * eam = nullptr);
+    void load_markov(const std::vector<std::string> & paths);
+    void observe_locked(llama_moe_stream_layer & sl, const int32_t * ids, const float * weights,
+                        uint32_t k, int64_t n_tokens, bool decode);
+    llama_moe_stream_policy policy = llama_moe_stream_policy::hotness;
+    const char * policy_name() const;
+    void load_eam(const std::vector<std::string> & paths);
+    void begin_iteration();
+    void predict_eam(llama_moe_stream_layer & sl, const int32_t * ids, uint32_t k);
+    std::string eam_path;
+    uint32_t eam_experts = 0;
+    std::vector<std::vector<uint32_t>> eam_history;
+    std::vector<double> eam_norms;
+    std::vector<uint32_t> iteration_eam;
+    int32_t eam_match = -1;
+    const char * eam_fallback = "non_decode";
+    bool decode_phase = false;
+    std::string matrix_path;
+    std::ofstream trace;
+    struct phase_stats {
+        int64_t hit = 0, miss = 0, loading = 0, cold = 0, all_hit = 0, tokens = 0;
+    } phases[2];
+    int64_t rule_us = 0;
+    int64_t bytes_read = 0;
+    int64_t loads = 0;
     void token_stats_begin();
     llama_moe_stream_token_stats token_stats_end();
 
@@ -248,6 +294,22 @@ struct llama_moe_stream {
 
     int64_t n_calls = 0;
 
+    bool debug = false;
+
+    struct {
+        int64_t n_calls     = 0; // remap invocations
+        int64_t n_hit       = 0; // touched experts already resident or loading
+        int64_t n_miss      = 0; // demand loads issued
+        int64_t n_miss_cold = 0; // first-ever touch of an expert
+        int64_t t_stall_us  = 0; // wait time in miss handling
+
+        int64_t n_wave_calls     = 0; // wave-ids invocations (>= n_calls under multi-pass prefill)
+        int64_t n_waves_run      = 0; // non-empty waves
+        int64_t n_preload_issued = 0; // next-wave loads started during a wave's compute
+        int64_t n_preload_ready  = 0; // wave experts already resident from the previous preload
+        int64_t t_stall_wave_us  = 0; // wait time in wave miss handling
+    } stats;
+
     bool token_stats_active = false;
     llama_moe_stream_token_stats token_stats;
 
@@ -279,6 +341,8 @@ struct llama_moe_stream {
 
 // callback of the id-remapping custom op inserted by build_moe_ffn
 void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata);
+void llama_moe_stream_remap_weighted(ggml_tensor * dst, const ggml_tensor * a,
+                                    const ggml_tensor * weights, int ith, int nth, void * userdata);
 
 // callbacks of the multi-pass prefill custom ops inserted by build_moe_ffn when a ubatch touches
 // more experts than the cache holds; each src[0] is the contiguous selected ids

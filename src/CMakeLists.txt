@@ -35,6 +35,7 @@ add_library(llama
             llama-model-saver.cpp
             llama-model.cpp
             llama-moe-stream.cpp
+            ../examples/gguf-hash/deps/sha256/sha256.c
             llama-quant.cpp
             llama-sampler.cpp
             llama-vocab.cpp
@@ -51,10 +52,14 @@ set_target_properties(llama PROPERTIES
 )
 
 target_include_directories(llama PRIVATE .)
+target_include_directories(llama PRIVATE ../examples/gguf-hash/deps)
 target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
+if (WIN32)
+    target_link_libraries(llama PRIVATE bcrypt)
+endif()
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)

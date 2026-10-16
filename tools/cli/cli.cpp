@@ -665,6 +665,11 @@ int llama_cli(int argc, char ** argv) {
             console::set_display(DISPLAY_TYPE_RESET);
         }
         llama_moe_stream_stats_print(ctx_cli.ctx_server.get_llama_context());
+        llama_moe_stream_print_stats(llama_get_model(ctx_cli.ctx_server.get_llama_context()));
+        if (params.moe_stream) {
+            fprintf(stderr, "moe_cache generated=%d decode_tps=%.6f prompt_tps=%.6f\n",
+                    timings.predicted_n, timings.predicted_per_second, timings.prompt_per_second);
+        }
 
         if (params.single_turn) {
             break;
